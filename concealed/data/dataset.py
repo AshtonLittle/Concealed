@@ -107,6 +107,52 @@ class ImageObfuscationDataset(Dataset):
         return torch.rand(3, self.resolution, self.resolution)
 
 
+def split_shared_val_and_train_shard(
+    all_files: Sequence[Path],
+    val_split: float = 0.1,
+    seed: int = 42,
+    max_images: Optional[int] = None,
+    num_shards: int = 1,
+    shard_id: int = 0,
+) -> Tuple[List[Path], List[Path]]:
+    """Split files into a globally shared validation set and a worker-specific training shard.
+
+    All shards receive the exact same ``val_files`` so validation analytics (PatchCos,
+    Feature Re-ID Evasion, Semantic Flip) are 100% comparable across Snowflake accounts,
+    while ``train_files`` are partitioned disjointly across ``num_shards``.
+    """
+    if not all_files:
+        raise ValueError("No image files provided for splitting.")
+
+    rng = random.Random(seed)
+    shuffled = list(all_files)
+    rng.shuffle(shuffled)
+
+    if len(shuffled) == 1:
+        return shuffled, shuffled
+
+    # Carve out a globally consistent validation gallery first
+    effective_for_val = min(len(shuffled), max_images) if (max_images and max_images > 0) else len(shuffled)
+    val_count = max(1, int(round(effective_for_val * val_split)))
+    val_count = min(val_count, len(shuffled) - 1)
+    val_files = shuffled[:val_count]
+    train_pool = shuffled[val_count:]
+
+    if num_shards > 1:
+        if not (0 <= shard_id < num_shards):
+            raise ValueError(f"shard_id must be in [0, {num_shards - 1}], got {shard_id}")
+        train_files = train_pool[shard_id::num_shards]
+    else:
+        train_files = train_pool
+
+    if max_images is not None and max_images > 0:
+        target_train = max(1, max_images - len(val_files))
+        if len(train_files) > target_train:
+            train_files = train_files[:target_train]
+
+    return train_files, val_files
+
+
 def create_train_val_dataloaders(
     data_dir: str | Path,
     resolution: int = 512,
@@ -115,26 +161,22 @@ def create_train_val_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     max_images: Optional[int] = None,
+    num_shards: int = 1,
+    shard_id: int = 0,
 ) -> Tuple[DataLoader, DataLoader]:
     """Discover images in ``data_dir``, split into train/val sets, and return DataLoaders."""
     all_files = discover_images(data_dir)
     if not all_files:
         raise ValueError(f"No supported images found in {data_dir}")
 
-    rng = random.Random(seed)
-    shuffled = list(all_files)
-    rng.shuffle(shuffled)
-
-    if max_images is not None and max_images > 0 and len(shuffled) > max_images:
-        shuffled = shuffled[:max_images]
-
-    if len(shuffled) == 1:
-        train_files = shuffled
-        val_files = shuffled
-    else:
-        val_count = max(1, int(round(len(shuffled) * val_split)))
-        val_files = shuffled[:val_count]
-        train_files = shuffled[val_count:]
+    train_files, val_files = split_shared_val_and_train_shard(
+        all_files=all_files,
+        val_split=val_split,
+        seed=seed,
+        max_images=max_images,
+        num_shards=num_shards,
+        shard_id=shard_id,
+    )
 
     train_ds = ImageObfuscationDataset(train_files, resolution=resolution, is_train=True)
     val_ds = ImageObfuscationDataset(val_files, resolution=resolution, is_train=False)
@@ -157,3 +199,4 @@ def create_train_val_dataloaders(
         drop_last=False,
     )
     return train_loader, val_loader
+

@@ -120,6 +120,132 @@ def load_generator_checkpoint(
     return generator, config
 
 
+def merge_generator_checkpoints(
+    checkpoint_paths: list[str | Path],
+    output_path: Optional[str | Path] = None,
+    base_checkpoint: Optional[str | Path] = None,
+    task_vector_scaling: float = 1.15,
+    temperature: float = 0.08,
+    device: str | torch.device = "cpu",
+) -> Tuple[AmortizedObfuscationGenerator, dict]:
+    """Merge multiple trained generator checkpoints via Validation-Weighted Model Soup & Task-Vector Arithmetic.
+
+    When ``base_checkpoint`` (the shared warm-start initialization theta_0) is provided and >1 worker
+    checkpoints are merged, applies Task-Vector / DiLoCo outer-step merging:
+        theta_merged = theta_0 + task_vector_scaling * sum_i w_i * (theta_i - theta_0)
+    Otherwise, performs validation-weighted Model Soup averaging:
+        theta_merged = sum_i w_i * theta_i
+    """
+    valid_paths = [Path(p) for p in checkpoint_paths if Path(p).exists()]
+    if not valid_paths:
+        raise FileNotFoundError(f"No valid checkpoints found in {checkpoint_paths}")
+
+    if len(valid_paths) == 1:
+        gen, cfg = load_generator_checkpoint(valid_paths[0], device=device)
+        ckpt = torch.load(valid_paths[0], map_location=device, weights_only=False)
+        info = {
+            "num_merged": 1,
+            "weights": [1.0],
+            "sources": [str(valid_paths[0])],
+            "metrics": ckpt.get("metrics", {}),
+        }
+        if output_path is not None:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(ckpt, output_path)
+        return gen, info
+
+    ckpts = [torch.load(p, map_location=device, weights_only=False) for p in valid_paths]
+    base_cfg = ckpts[0].get("config", {})
+    generator = build_generator(base_cfg)
+    target_sd = generator.state_dict()
+
+    # Compute validation-evasion quality score for each worker checkpoint
+    scores: list[float] = []
+    for c in ckpts:
+        m = c.get("metrics", {})
+        p_cos = float(m.get("patch_cos_sim", 0.85))
+        s_cos = float(m.get("salient_patch_cos", p_cos))
+        sem_flip = float(m.get("semantic_neighbor_flip_pct", 0.0))
+        score = (1.0 - p_cos) + 0.5 * (1.0 - s_cos) + 0.003 * sem_flip
+        scores.append(score)
+
+    score_tensor = torch.tensor(scores, dtype=torch.float64)
+    weights = torch.softmax(score_tensor / max(temperature, 1e-4), dim=0).tolist()
+
+    base_sd: Optional[dict] = None
+    if base_checkpoint is not None and Path(base_checkpoint).exists():
+        base_raw = torch.load(base_checkpoint, map_location=device, weights_only=False)
+        base_sd = base_raw.get("generator_state_dict", base_raw)
+
+    merged_sd: Dict[str, torch.Tensor] = {}
+    for k, ref_tensor in target_sd.items():
+        if not ref_tensor.is_floating_point():
+            merged_sd[k] = ref_tensor.clone()
+            continue
+
+        worker_tensors = []
+        worker_weights = []
+        for w, c in zip(weights, ckpts):
+            sd = c.get("generator_state_dict", c)
+            if k in sd and sd[k].shape == ref_tensor.shape:
+                worker_tensors.append(sd[k].to(device=device, dtype=torch.float32))
+                worker_weights.append(w)
+
+        if not worker_tensors:
+            merged_sd[k] = ref_tensor.clone()
+            continue
+
+        w_sum = sum(worker_weights) or 1.0
+        norm_w = [w / w_sum for w in worker_weights]
+        weighted_avg = sum(w * t for w, t in zip(norm_w, worker_tensors))
+
+        if base_sd is not None and k in base_sd and base_sd[k].shape == ref_tensor.shape and k != "epsilon":
+            t0 = base_sd[k].to(device=device, dtype=torch.float32)
+            delta_task = weighted_avg - t0
+            merged_val = t0 + float(task_vector_scaling) * delta_task
+        else:
+            merged_val = weighted_avg
+
+        merged_sd[k] = merged_val.to(dtype=ref_tensor.dtype)
+
+    generator.load_state_dict(merged_sd, strict=False)
+    generator.to(device).eval()
+
+    # Aggregate validation metrics weighted by worker weights
+    merged_metrics: Dict[str, float] = {}
+    all_metric_keys = set()
+    for c in ckpts:
+        all_metric_keys.update(c.get("metrics", {}).keys())
+    for mk in sorted(all_metric_keys):
+        vals = [float(c.get("metrics", {}).get(mk, 0.0)) for c in ckpts if mk in c.get("metrics", {})]
+        if vals:
+            merged_metrics[mk] = round(float(sum(w * float(c.get("metrics", {}).get(mk, vals[0])) for w, c in zip(weights, ckpts))), 4)
+
+    merge_info = {
+        "num_merged": len(valid_paths),
+        "weights": [round(w, 4) for w in weights],
+        "sources": [str(p) for p in valid_paths],
+        "task_vector_scaling": float(task_vector_scaling) if base_sd is not None else 1.0,
+        "metrics": merged_metrics,
+    }
+
+    if output_path is not None:
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generator_state_dict": generator.state_dict(),
+            "raw_generator_state_dict": generator.state_dict(),
+            "config": base_cfg,
+            "epoch": max(int(c.get("epoch", 0)) for c in ckpts),
+            "metrics": merged_metrics,
+            "merge_info": merge_info,
+        }
+        torch.save(payload, out_p)
+
+    return generator, merge_info
+
+
+
 @torch.no_grad()
 def validate(
     generator: AmortizedObfuscationGenerator,
@@ -227,11 +353,15 @@ def train(
     device_str: Optional[str] = None,
     pretrained_surrogates: bool = True,
     on_epoch_end: Optional[object] = None,
+    init_checkpoint: Optional[str | Path] = None,
 ) -> Tuple[AmortizedObfuscationGenerator, Dict[str, float]]:
     """Execute end-to-end training of the Amortized Obfuscation Generator."""
     train_cfg = config.get("training", {})
     seed = int(train_cfg.get("seed", 42))
-    set_seed(seed)
+    num_shards = max(1, int(train_cfg.get("num_shards", 1)))
+    shard_id = int(train_cfg.get("shard_id", 0))
+    # Vary augmentation / batch ordering RNG per shard while keeping validation split seed fixed
+    set_seed(seed + shard_id * 101)
 
     if device_str:
         device = torch.device(device_str)
@@ -261,9 +391,22 @@ def train(
         num_workers=num_workers,
         seed=seed,
         max_images=max_images,
+        num_shards=num_shards,
+        shard_id=shard_id,
     )
 
     generator = build_generator(config).to(device)
+    ckpt_to_load = init_checkpoint or train_cfg.get("init_checkpoint")
+    if ckpt_to_load and Path(ckpt_to_load).exists():
+        ckpt_data = torch.load(ckpt_to_load, map_location=device, weights_only=False)
+        raw_sd = ckpt_data.get("generator_state_dict", ckpt_data)
+        target_sd = generator.state_dict()
+        filtered_sd = {
+            k: v for k, v in raw_sd.items() if k in target_sd and target_sd[k].shape == v.shape and k != "epsilon"
+        }
+        generator.load_state_dict(filtered_sd, strict=False)
+        print(f"  [Warm-Start] Initialized generator weights from {ckpt_to_load}", flush=True)
+
     ema = ModelEMA(generator, decay=float(train_cfg.get("ema_decay", 0.995)))
 
     surrogates = build_surrogate_ensemble(config, key="train_models", pretrained=pretrained_surrogates)
