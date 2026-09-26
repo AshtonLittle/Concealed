@@ -193,7 +193,7 @@ class WeberTextureMask(nn.Module):
     perturbations while textured regions use the full epsilon budget.
     """
 
-    def __init__(self, min_mask_scale: float = 0.55) -> None:
+    def __init__(self, min_mask_scale: float = 0.10) -> None:
         super().__init__()
         self.min_mask_scale = min_mask_scale
         sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]) / 8.0
@@ -234,7 +234,7 @@ class AmortizedObfuscationGenerator(nn.Module):
         mode: SynthesisMode = "hybrid",
         canonical_size: int = 384,
         tile_size: int = 384,
-        hybrid_global_weight: float = 0.6,
+        hybrid_global_weight: float = 0.25,
         luminance_texture_masking: bool = True,
         use_dct_stem: bool = True,
     ) -> None:
