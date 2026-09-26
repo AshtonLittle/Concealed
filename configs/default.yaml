@@ -41,8 +41,18 @@ surrogates:
 
   # Optional CLI profiles selectable via `--profile <name>`:
   profiles:
-    # Fast 4-model Hub ensemble (skips Qwen-Image-2.1 if not cloned/hosted)
+    # Fast ensemble (~1.1 GB total weights — ideal for quick staging on Snowflake Trial Accounts)
     fast:
+      cpu_offload: false
+      train_models:
+        - name: "google/siglip-base-patch16-224"
+          weight: 1.0
+        - name: "openai/clip-vit-base-patch16"
+          weight: 1.0
+        - name: "facebook/dinov2-base"
+          weight: 1.0
+    # Heavy 4-model Hub ensemble (SigLIP-SO400M + DFN5B ViT-H/14 + OpenCLIP ConvNeXt-Large + DINOv2-Large)
+    heavy:
       cpu_offload: false
       train_models:
         - name: "google/siglip-so400m-patch14-384"
