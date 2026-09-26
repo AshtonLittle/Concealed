@@ -270,6 +270,56 @@ def main() -> None:
         print("Done canceling jobs.")
         return
 
+    def _print_stage_epoch_reports(out_dir_path: Path, printed_epochs: set[int]) -> int:
+        import json
+
+        out_dir_path.mkdir(parents=True, exist_ok=True)
+        try:
+            session.file.get("@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/training_log.json", str(out_dir_path))
+        except Exception:
+            return 0
+        log_file = out_dir_path / "training_log.json"
+        if not log_file.exists():
+            return 0
+        try:
+            history = json.loads(log_file.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+
+        max_ep = 0
+        for entry in history:
+            ep = int(entry.get("epoch", 0))
+            max_ep = max(max_ep, ep)
+            if ep in printed_epochs:
+                continue
+            printed_epochs.add(ep)
+            val_s = entry.get("val", {})
+            el = float(entry.get("elapsed_sec", 0.0))
+            print(
+                f"\n+---------------------------------------------------------------------------------------+\n"
+                f"| EPOCH {ep:02d} ANALYTICS REPORT ({el:.1f}s) [Synced from @MODEL_STAGE]\n"
+                f"+---------------------------------------------------------------------------------------+\n"
+                f"| Feature Disruption : Patch Cos = {val_s.get('patch_cos_sim', 0.0):.4f} | Salient Foreground Cos = {val_s.get('salient_patch_cos', 0.0):.4f} | Global Cos = {val_s.get('global_cos_sim', 0.0):.4f}\n"
+                f"| Identification Stat: Feature ID Evasion = {val_s.get('feature_reid_evasion_pct', 0.0):5.1f}% | Semantic Category Flip = {val_s.get('semantic_neighbor_flip_pct', 0.0):5.1f}%\n"
+                f"| Spatial Masking    : Patches <0.70 Sim  = {val_s.get('concealed_patches_70_pct', 0.0):5.1f}% | Patches <0.50 Sim      = {val_s.get('concealed_patches_50_pct', 0.0):5.1f}%\n"
+                f"| Visual Stealth     : PSNR = {val_s.get('psnr_db', 0.0):.2f} dB | Chroma Shift = {val_s.get('chroma_rms_255', 0.0):.2f}/255 | L_inf = {val_s.get('linf_255', 0.0):.2f}/255 | UAP Ratio = {val_s.get('uap_collapse_ratio', 0.0):.3f}\n"
+                f"| Per-Transformer Breakdown:",
+                flush=True,
+            )
+            for k, v in val_s.items():
+                if k.startswith("patch_cos/"):
+                    s_name = k.split("/", 1)[1]
+                    s_c = val_s.get(f"salient_cos/{s_name}", 0.0)
+                    g_c = val_s.get(f"global_cos/{s_name}", 0.0)
+                    ev_p = val_s.get(f"reid_evasion_pct/{s_name}", 0.0)
+                    fl_p = val_s.get(f"semantic_flip_pct/{s_name}", 0.0)
+                    print(
+                        f"|   * {s_name:28s} -> PatchCos: {v:.4f} | SalientCos: {s_c:.4f} | GlobalCos: {g_c:.4f} | ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
+                        flush=True,
+                    )
+            print("+---------------------------------------------------------------------------------------+", flush=True)
+        return max_ep
+
     if args.status is not None:
         from snowflake.ml.jobs import get_job, list_jobs
 
@@ -297,8 +347,28 @@ def main() -> None:
                 active_id = f"CONCEALED_DB.PUBLIC.{active_rows.iloc[0]['name']}"
                 print(f"NOTE   : This old job is CANCELLED. Active job is: {active_id}")
                 print("         Run `concealed-snowflake --status` (with no ID) to view the active job.")
-        print("\n--- Latest Container Logs ---")
-        job.show_logs()
+
+        out_dir = Path(args.output_dir)
+        printed: set[int] = set()
+        latest_ep = _print_stage_epoch_reports(out_dir, printed)
+        if latest_ep > 0:
+            print(f"\n[Stage Sync] Syncing latest checkpoints (Epoch {latest_ep}) from @MODEL_STAGE/latest to {out_dir} ...")
+            try:
+                session.file.get("@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/", str(out_dir))
+                (out_dir / "samples").mkdir(parents=True, exist_ok=True)
+                session.file.get("@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/samples/", str(out_dir / "samples"))
+                best_pt = out_dir / "best_generator.pt"
+                if best_pt.exists():
+                    gen, _ = load_generator_checkpoint(best_pt, device="cpu")
+                    onnx_info = export_to_onnx(gen, out_dir / "generator.onnx", verify=True)
+                    print(f"Updated local ONNX model -> {onnx_info['onnx_path']} ({onnx_info['size_mb']} MB)")
+            except Exception as exc:
+                print(f"  (Checkpoint sync note: {exc})")
+        else:
+            print("\n--- Latest Container Logs (Tail) ---")
+            lines = job.get_logs(as_list=True)
+            for ln in lines[-40:]:
+                print(ln)
         return
 
     if not args.data_dir:
@@ -475,7 +545,9 @@ def main() -> None:
 
     import time
 
-    seen_log_lines = 0
+    seen_lines_set: set[str] = set()
+    printed_stage_epochs: set[int] = set()
+    out_dir = Path(args.output_dir)
     noise_tokens = (
         "logger=",
         "otelcol",
@@ -488,19 +560,25 @@ def main() -> None:
         "logit_bias",
         "visual_projection",
         "-------------------------------------------------------------+",
+        "%|",
     )
     try:
         while True:
             st = str(job.status).upper()
             try:
                 lines = job.get_logs(as_list=True)
-                if isinstance(lines, list) and len(lines) > seen_log_lines:
-                    for ln in lines[seen_log_lines:]:
-                        if not any(tok in ln for tok in noise_tokens):
+                if isinstance(lines, list):
+                    for ln in lines:
+                        s_ln = ln.strip()
+                        if s_ln and s_ln not in seen_lines_set and not any(tok in ln for tok in noise_tokens):
+                            seen_lines_set.add(s_ln)
                             print(ln, flush=True)
-                    seen_log_lines = len(lines)
             except Exception:
                 pass
+
+            # Also poll @MODEL_STAGE/latest/training_log.json (never truncates even if container log buffer fills)
+            _print_stage_epoch_reports(out_dir, printed_stage_epochs)
+
             if st in {"DONE", "FAILED", "CANCELLED", "INTERNAL_ERROR", "DELETED"}:
                 break
             time.sleep(4.0)
