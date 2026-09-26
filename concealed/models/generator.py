@@ -193,7 +193,7 @@ class WeberTextureMask(nn.Module):
     perturbations while textured regions use the full epsilon budget.
     """
 
-    def __init__(self, min_mask_scale: float = 0.10) -> None:
+    def __init__(self, min_mask_scale: float = 0.14) -> None:
         super().__init__()
         self.min_mask_scale = min_mask_scale
         sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]) / 8.0
@@ -208,7 +208,6 @@ class WeberTextureMask(nn.Module):
         mag = torch.sqrt(grads[:, 0:1] ** 2 + grads[:, 1:2] ** 2 + 1e-6)
         # Smooth local texture energy over a 5x5 neighborhood
         energy = F.avg_pool2d(mag, kernel_size=5, stride=1, padding=2)
-        # Normalize via tanh saturation into [min_mask_scale, 1.0]
         normalized = torch.tanh(energy * 12.0)
         mask = self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
         return mask
@@ -330,7 +329,7 @@ class AmortizedObfuscationGenerator(nn.Module):
         # Initialize final head with small weights for stable start
         nn.init.normal_(self.head[-1].weight, mean=0.0, std=0.02)
 
-        self.texture_mask = WeberTextureMask(min_mask_scale=0.30)
+        self.texture_mask = WeberTextureMask(min_mask_scale=0.06)
 
     def set_epsilon_255(self, epsilon_255: float) -> None:
         """Dynamically adjust the L_infinity perturbation bound at inference or training time."""

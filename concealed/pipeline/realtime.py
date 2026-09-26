@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -233,22 +234,44 @@ class RealtimeObfuscator:
         x_0 = x_init.to(dev).float()
         eps = float(epsilon_255 if epsilon_255 is not None else (self.generator.epsilon_255 if self.generator else 10.0)) / 255.0
 
-        names = surrogate_names or ["timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k"]
+        if Path(".snowflake_hf_cache").exists():
+            os.environ.setdefault("HF_HOME", str(Path(".snowflake_hf_cache").resolve()))
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        try:
+            from transformers.utils import logging as hf_logging
+            hf_logging.set_verbosity_error()
+        except Exception:
+            pass
+
+        names = surrogate_names or [
+            "google/siglip-base-patch16-224",
+            "openai/clip-vit-base-patch16",
+            "facebook/dinov2-base",
+            "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
+        ]
         models = [VisionTransformerSurrogate(n, tap_layers=(-3, -2, -1)).to(dev).eval() for n in names]
-        weber = WeberTextureMask(min_mask_scale=0.30).to(dev)
+        weber = WeberTextureMask(min_mask_scale=0.14).to(dev)
 
         h, w = x_c.shape[-2], x_c.shape[-1]
         with torch.no_grad():
             tex_mask = weber(x_c)
             clean_targets = [m(x_c) for m in models]
+            if self.generator is not None:
+                x_224 = F.interpolate(x_c, size=(224, 224), mode="bilinear", align_corners=False)
+                x_384 = F.interpolate(x_c, size=(384, 384), mode="bilinear", align_corners=False)
+                raw_init_224 = (0.35 * torch.tanh(self.generator._forward_padded(x_224))).detach().clone()
+                raw_init_384 = (0.35 * torch.tanh(self.generator._forward_padded(x_384))).detach().clone()
+            else:
+                init_delta = (x_0 - x_c).clamp(-eps * 0.99, eps * 0.99)
+                init_224 = F.interpolate(init_delta, size=(224, 224), mode="bilinear", align_corners=False)
+                init_384 = F.interpolate(init_delta, size=(384, 384), mode="bilinear", align_corners=False)
+                raw_init_224 = torch.atanh((init_224 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone()
+                raw_init_384 = torch.atanh((init_384 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone()
 
-        # Parameterize directly at ViT canonical scale (224x224) + mid-scale (384x384) to avoid downsample gradient dilution
-        init_delta = (x_0 - x_c).clamp(-eps * 0.99, eps * 0.99)
-        init_224 = F.interpolate(init_delta, size=(224, 224), mode="bilinear", align_corners=False)
-        init_384 = F.interpolate(init_delta, size=(384, 384), mode="bilinear", align_corners=False)
-        param_224 = torch.atanh((init_224 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone().requires_grad_(True)
-        param_384 = torch.atanh((init_384 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone().requires_grad_(True)
-        opt = torch.optim.Adam([param_224, param_384], lr=0.25)
+        param_224 = raw_init_224.requires_grad_(True)
+        param_384 = raw_init_384.requires_grad_(True)
+        opt = torch.optim.Adam([param_224, param_384], lr=0.28)
 
         def _synthesize_delta() -> torch.Tensor:
             # High-pass filter at both 224 and 384 scales so no wide (>9px) wavy bands can form
@@ -258,9 +281,9 @@ class RealtimeObfuscator:
             up_384 = F.interpolate(hp_384, size=(h, w), mode="bilinear", align_corners=False)
             raw = 0.65 * up_224 + 0.35 * up_384
             d = eps * torch.tanh(raw)
-            # YCbCr chrominance damping (suppresses magenta/green waves by 70%)
+            # YCbCr chrominance damping (suppresses magenta/green waves by 75%)
             d_y = 0.299 * d[:, 0:1] + 0.587 * d[:, 1:2] + 0.114 * d[:, 2:3]
-            d = (d_y + 0.30 * (d - d_y)) * tex_mask
+            d = (d_y + 0.25 * (d - d_y)) * tex_mask
             return torch.clamp(d, -eps, eps)
 
         print(f"\n--- Running Hybrid High-Pass ViT Refinement ({steps} steps, eps={eps * 255:.1f}/255) ---", flush=True)
@@ -342,7 +365,22 @@ class RealtimeObfuscator:
         delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
         chroma_rms_255 = float((delta - delta_y).pow(2).mean().sqrt().item() * 255.0)
 
-        model_list = eval_models or ["timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k"]
+        if Path(".snowflake_hf_cache").exists():
+            os.environ.setdefault("HF_HOME", str(Path(".snowflake_hf_cache").resolve()))
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        try:
+            from transformers.utils import logging as hf_logging
+            hf_logging.set_verbosity_error()
+        except Exception:
+            pass
+
+        model_list = eval_models or [
+            "google/siglip-base-patch16-224",
+            "openai/clip-vit-base-patch16",
+            "facebook/dinov2-base",
+            "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
+        ]
         model_reports = []
 
         for mname in model_list:
