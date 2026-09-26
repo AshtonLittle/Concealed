@@ -248,12 +248,19 @@ class VisionTransformerSurrogate(nn.Module):
             elif "dinov2" in lower_name:
                 model = Dinov2Model.from_pretrained(model_name)
             else:
+                import gc
+
                 full_model = AutoModel.from_pretrained(
                     model_name,
                     trust_remote_code=True,
                     torch_dtype="auto",
                 )
                 model = cls._extract_vision_tower(full_model).float()
+                if model is not full_model:
+                    del full_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         else:
             mean, std, img_h, img_w = default_mean, default_std, default_size, default_size
             if "siglip" in lower_name:
