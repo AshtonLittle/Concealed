@@ -30,3 +30,6 @@ Thumbs.db
 
 #pictures
 *.png
+
+# Mockups
+mockups/
