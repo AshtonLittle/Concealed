@@ -16,7 +16,7 @@ pip install -r requirements.txt
 ```
 
 > **Note on Model Weights**: Model weights (`*.pt` and `*.onnx`) are deliberately excluded from Git. They are automatically downloaded on your first run:
-> - **YOLO11m-seg**, **YOLO11m-pose**, **YOLOv8m-worldv2**, and **FastSAM-s** are downloaded automatically by Ultralytics.
+> - **YOLO11m-seg**, **YOLO11m-pose**, **YOLOv8x-worldv2**, and **FastSAM-s** are downloaded automatically by Ultralytics.
 > - **PP-OCRv3** text detector is downloaded automatically by the script.
 
 ### 3. Run the Processor

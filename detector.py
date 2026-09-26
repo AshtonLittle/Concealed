@@ -1,12 +1,12 @@
 """
 High-Precision Conforming Feature Detection Module
-Upgraded with state-of-the-art YOLO11-Medium and YOLO-World-Medium models.
+Upgraded with state-of-the-art YOLO11-Medium and YOLO-World-X models.
 Features:
   - Recalibrated neural text recognition (PP-OCRv3 via OpenCV DBNet)
   - High-fidelity human pose and body-part segmentation (YOLO11m-pose + YOLO11m-seg)
   - Upgraded COCO instance segmentation (YOLO11m-seg)
-  - Universal recognition for non-prerecognized features via YOLO-World-M + FastSAM
-    (open-vocabulary grounding followed by prompt-based silhouette segmentation)
+  - Universal recognition for non-prerecognized features via YOLO-World-X + FastSAM
+    (open-vocabulary grounding with Universal Baseline Vocabulary suppression)
 """
 
 from dataclasses import dataclass
@@ -135,11 +135,11 @@ def _get_seg_model():
 
 
 def _get_world_model():
-    """YOLO-World v2 Medium open-vocabulary detector."""
+    """YOLO-World v2 X-Large open-vocabulary detector for maximum semantic discrimination."""
     global _WORLD_MODEL
     if _WORLD_MODEL is None:
         from ultralytics import YOLO
-        _WORLD_MODEL = YOLO("yolov8m-worldv2.pt")
+        _WORLD_MODEL = YOLO("yolov8x-worldv2.pt")
     return _WORLD_MODEL
 
 
@@ -464,6 +464,22 @@ def detect_conforming_pose(path_str: str, feature: str, conf: float = 0.25) -> L
 # 3. ADVANCED RECOGNITION FOR NON-PRERECOGNIZED & ARBITRARY FEATURES
 # =====================================================================
 
+# Universal baseline vocabulary to competitively suppress visual false positives.
+# When querying an open-vocabulary feature (e.g. 'door'), these common classes
+# compete against the target. If an image region matches 'shirt' or 'person' higher
+# than 'door', the false positive is automatically suppressed.
+UNIVERSAL_BASELINE_CLASSES = [
+    # Humans & Clothing
+    "person", "human", "clothing", "shirt", "t-shirt", "pants", "jeans", "jacket", "coat", "shoes", "hat",
+    # Furniture & Architectural
+    "chair", "couch", "sofa", "bed", "table", "desk", "wall", "floor", "ceiling", "window", "cabinet", "shelf",
+    # Everyday Objects & Electronics
+    "laptop", "computer", "phone", "tv", "screen", "bottle", "cup", "bag", "backpack",
+    # Vehicles & Nature
+    "car", "vehicle", "bicycle", "tree", "plant", "ground", "sky"
+]
+
+
 def _expand_feature_queries(feature: str) -> List[str]:
     """Generates natural language query variations to maximize open-vocabulary recall."""
     feat = feature.strip().lower()
@@ -481,10 +497,11 @@ def detect_conforming_arbitrary(path_str: str, feature: str, conf: float = 0.25)
     
     Architecture:
     1. YOLO11m-seg: Fast, high-accuracy instance segmentation for standard COCO categories.
-    2. YOLO-World-M Grounding + FastSAM Box Prompting:
-       Uses YOLO-World-M to ground the arbitrary query across the image, then feeds
-       the candidate bounding boxes into FastSAM to produce pixel-precise conforming contours.
-    3. FastSAM Open-Vocabulary Text Prompting: Direct CLIP-prompted mask search.
+    2. YOLO-World-X Grounding + Universal Baseline Competition + FastSAM Box Prompting:
+       Uses YOLO-World-X with competitive baseline suppression to ground the arbitrary query
+       without hallucinating on background objects (e.g., shirts mistagged as doors).
+       Candidate bounding boxes are then fed into FastSAM for pixel-precise conforming contours.
+    3. FastSAM Open-Vocabulary Text Prompting: Direct CLIP-prompted mask search (calibrated conf).
     4. Fallback: Bounding box GrabCut segmentation.
     """
     feature_clean = feature.strip().lower()
@@ -523,23 +540,37 @@ def detect_conforming_arbitrary(path_str: str, feature: str, conf: float = 0.25)
             return regions
 
     # -------------------------------------------------------------
-    # Step 2: Non-Prerecognized Features: YOLO-World-M + FastSAM Synergy
+    # Step 2: Non-Prerecognized Features: YOLO-World-X + Universal Baseline Suppression
     # -------------------------------------------------------------
-    queries = _expand_feature_queries(feature_clean)
-    world_model = _get_world_model()
-    world_model.set_classes(queries)
+    target_queries = _expand_feature_queries(feature_clean)
+    target_set = set(q.lower() for q in target_queries)
     
-    # Run YOLO-World-M with adaptive confidence threshold
-    world_conf = max(0.08, conf * 0.5)
+    # Filter baseline distractors so they don't overlap with the user's requested feature
+    distractors = [c for c in UNIVERSAL_BASELINE_CLASSES if c not in target_set and feature_clean not in c]
+    all_classes = target_queries + distractors
+    
+    world_model = _get_world_model()
+    world_model.set_classes(all_classes)
+    
+    # Calibrated confidence threshold (no halving down into noise floor)
+    world_conf = max(0.20, conf)
     world_results = world_model.predict(path_str, conf=world_conf, verbose=False)[0]
     
     detected_boxes = []
-    for box in world_results.boxes:
-        coords = [int(v) for v in box.xyxy[0].tolist()]
-        box_conf = float(box.conf[0])
-        detected_boxes.append((coords, box_conf))
+    if world_results.boxes is not None and len(world_results.boxes) > 0:
+        for box in world_results.boxes:
+            cls_id = int(box.cls[0])
+            pred_label = all_classes[cls_id]
+            box_conf = float(box.conf[0])
+            
+            # CRITICAL COMPETITIVE SUPPRESSION:
+            # Only keep detections where the user's target query beat all baseline distractors!
+            if pred_label in target_set:
+                coords = [int(v) for v in box.xyxy[0].tolist()]
+                detected_boxes.append((coords, box_conf))
         
     if detected_boxes:
+        print(f"[*] YOLO-World-X grounded {len(detected_boxes)} region(s) for '{feature_clean}'")
         fastsam = _get_fastsam_model()
         for coords, b_conf in detected_boxes:
             bx1, by1, bx2, by2 = coords
@@ -575,30 +606,6 @@ def detect_conforming_arbitrary(path_str: str, feature: str, conf: float = 0.25)
                 
             regions.append(ConformingRegion(bx1, by1, bx2, by2, crop_mask, feature_clean, b_conf))
             
-        if regions:
-            return regions
-
-    # -------------------------------------------------------------
-    # Step 3: FastSAM Direct Text Prompting
-    # -------------------------------------------------------------
-    fastsam = _get_fastsam_model()
-    fastsam_conf = max(0.10, conf * 0.5)
-    fs_results = fastsam(path_str, texts=feature_clean, conf=fastsam_conf, verbose=False)[0]
-    
-    if fs_results.masks is not None and len(fs_results.masks) > 0:
-        for i, poly in enumerate(fs_results.masks.xy):
-            if len(poly) >= 3:
-                x1 = max(0, int(poly[:, 0].min()))
-                y1 = max(0, int(poly[:, 1].min()))
-                x2 = min(w, int(poly[:, 0].max()) + 1)
-                y2 = min(h, int(poly[:, 1].max()) + 1)
-                
-                if x2 > x1 and y2 > y1:
-                    crop_mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
-                    rel_poly = (poly - np.array([x1, y1])).astype(np.int32)
-                    cv2.fillPoly(crop_mask, [rel_poly], 255)
-                    regions.append(ConformingRegion(x1, y1, x2, y2, crop_mask, feature_clean, conf))
-                    
     return regions
 
 
