@@ -247,18 +247,70 @@ def train(
         for idx, x_clean in enumerate(pbar):
             x_clean = x_clean.to(device, non_blocking=True)
 
-            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                x_obf, delta = generator(x_clean, return_delta=True)
-                x_clean_aug, x_obf_aug = eot(x_clean, x_obf)
+            if surrogates.sequential_offload and len(surrogates.surrogates) > 1:
+                # OOM-Proof Sequential Surrogate Backward:
+                # Evaluates and backpropagates one large surrogate at a time into a detached leaf
+                # tensor `x_obf_leaf`, so only ONE giant surrogate's activation graph resides in
+                # GPU VRAM at any moment.
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    x_obf, delta = generator(x_clean, return_delta=True)
 
-                with torch.no_grad():
-                    clean_outputs = surrogates(x_clean_aug)
-                obf_outputs = surrogates(x_obf_aug)
+                x_obf_leaf = x_obf.detach().requires_grad_(True)
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    x_clean_aug, x_obf_aug = eot(x_clean, x_obf_leaf)
 
-                loss, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
-                scaled_loss = loss / grad_accum
+                total_w = sum(s.weight for s in surrogates.surrogates) or 1.0
+                agg_patch_cos = 0.0
+                agg_glob_cos = 0.0
+                agg_sur_loss = 0.0
 
-            scaler.scale(scaled_loss).backward()
+                for s_mod in surrogates.surrogates:
+                    if device.type == "cuda":
+                        s_mod.to(device)
+                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                        with torch.no_grad():
+                            c_out = s_mod(x_clean_aug)
+                        o_out = s_mod(x_obf_aug)
+                        s_loss, s_metrics = loss_fn.compute_surrogate_disruption([c_out], [o_out])
+                        weighted_s_loss = s_loss * (s_mod.weight / total_w) / grad_accum
+                    scaler.scale(weighted_s_loss).backward(retain_graph=True)
+                    if device.type == "cuda":
+                        s_mod.to("cpu")
+
+                    w_ratio = s_mod.weight / total_w
+                    agg_patch_cos += s_metrics["patch_cos_sim"] * w_ratio
+                    agg_glob_cos += s_metrics["global_cos_sim"] * w_ratio
+                    agg_sur_loss += s_metrics["surrogate_loss"] * w_ratio
+
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    stealth_loss, stealth_metrics = loss_fn.compute_perceptual_stealth(x_clean, x_obf, delta)
+                    scaled_stealth = stealth_loss / grad_accum
+
+                # Propagate accumulated surrogate gradients + stealth loss through the generator
+                assert x_obf_leaf.grad is not None
+                surrogate_grad_bridge = (x_obf * x_obf_leaf.grad.detach()).sum()
+                (surrogate_grad_bridge + scaler.scale(scaled_stealth)).backward()
+
+                metrics = {
+                    "patch_cos_sim": agg_patch_cos,
+                    "global_cos_sim": agg_glob_cos,
+                    "surrogate_loss": agg_sur_loss,
+                    **stealth_metrics,
+                    "total_loss": agg_sur_loss + stealth_metrics["stealth_loss"],
+                }
+            else:
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    x_obf, delta = generator(x_clean, return_delta=True)
+                    x_clean_aug, x_obf_aug = eot(x_clean, x_obf)
+
+                    with torch.no_grad():
+                        clean_outputs = surrogates(x_clean_aug)
+                    obf_outputs = surrogates(x_obf_aug)
+
+                    loss, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
+                    scaled_loss = loss / grad_accum
+
+                scaler.scale(scaled_loss).backward()
 
             if (idx + 1) % grad_accum == 0 or (idx + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
@@ -358,17 +410,34 @@ def main() -> None:
         help="Override generator capacity preset",
     )
     parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["default", "fast", "ocr", "full"],
+        default=None,
+        help="Select built-in surrogate model profile ('default'=SigLIP+DFN5B+ConvNeXt+DINOv2, 'ocr'=GLM-OCR priority, 'full'=all 6 models)",
+    )
+    parser.add_argument(
         "--surrogates",
         type=str,
         nargs="+",
         default=None,
-        help="Override training surrogate model names (e.g., openai/clip-vit-base-patch16 google/siglip-base-patch16-224)",
+        help="Override training surrogate model names or aliases (e.g., siglip-so400m dfn5b openclip-convnext-large dinov2-large glm-ocr)",
     )
     parser.add_argument("--device", type=str, default=None, help="Override compute device (cuda or cpu)")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    if args.profile and args.profile != "default":
+        prof = config.get("surrogates", {}).get("profiles", {}).get(args.profile)
+        if prof:
+            config["surrogates"]["train_models"] = prof["train_models"]
+            if "sequential_offload" in prof:
+                config["surrogates"]["sequential_offload"] = prof["sequential_offload"]
+        if args.profile == "ocr":
+            # For OCR obfuscation, prioritize high-res local tile branch
+            config.setdefault("generator", {})["hybrid_global_weight"] = 0.35
 
     if args.epochs is not None:
         config.setdefault("training", {})["epochs"] = args.epochs

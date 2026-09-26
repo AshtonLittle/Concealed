@@ -42,7 +42,7 @@ def test_end_to_end_train_export_and_realtime_pipeline(tmp_path: Path) -> None:
             "use_dct_stem": True,
         },
         "surrogates": {
-            "sequential_offload": False,
+            "sequential_offload": True,
             "tap_layers": [-2, -1],
             "train_models": [
                 {"name": "mock/tiny-vit-16", "weight": 1.0},

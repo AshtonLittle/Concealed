@@ -65,6 +65,13 @@ def main() -> None:
         choices=["GPU_NV_S", "GPU_NV_M", "GPU_NV_L"],
         help="Snowflake GPU instance family (default: GPU_NV_S = 1x NVIDIA A10G 24GB VRAM)",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["default", "fast", "ocr", "full"],
+        default=None,
+        help="Select built-in surrogate profile ('default', 'fast', 'ocr', or 'full')",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs")
     parser.add_argument("--surrogates", type=str, nargs="+", default=None, help="Override ViT surrogate model names")
     args = parser.parse_args()
@@ -107,6 +114,14 @@ def main() -> None:
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    if args.profile and args.profile != "default":
+        prof = config.get("surrogates", {}).get("profiles", {}).get(args.profile)
+        if prof:
+            config["surrogates"]["train_models"] = prof["train_models"]
+            if "sequential_offload" in prof:
+                config["surrogates"]["sequential_offload"] = prof["sequential_offload"]
+        if args.profile == "ocr":
+            config.setdefault("generator", {})["hybrid_global_weight"] = 0.35
     if args.epochs is not None:
         config.setdefault("training", {})["epochs"] = args.epochs
     if args.surrogates is not None:
