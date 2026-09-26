@@ -94,7 +94,9 @@ def load_env_file(env_path: str | Path = ".env") -> None:
         line = raw_line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            key = k.strip().replace("SNOWFLAE_", "SNOWFLAKE_")
+            val = v.strip().strip('"').strip("'")
+            os.environ[key] = val
 
 
 def _is_placeholder(val: str) -> bool:
@@ -112,7 +114,7 @@ def discover_snowflake_accounts(
     """Discover all configured Snowflake accounts from environment variables / `.env`.
 
     Supports both:
-      - Unnumbered `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD` (as slot 1)
+      - Unnumbered `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`
       - Numbered `SNOWFLAKE_ACCOUNT_1..16`, `SNOWFLAKE_USER_1..16`, `SNOWFLAKE_PASSWORD_1..16`
     """
     load_env_file(env_path)
@@ -123,37 +125,42 @@ def discover_snowflake_accounts(
     accounts: List[SnowflakeAccountSpec] = []
     seen_keys: set[tuple[str, str]] = set()
 
-    # Check numbered slots 1..16
-    for slot in range(1, 17):
-        acct = os.environ.get(f"SNOWFLAKE_ACCOUNT_{slot}", "")
-        user = os.environ.get(f"SNOWFLAKE_USER_{slot}", "")
-        pwd = os.environ.get(f"SNOWFLAKE_PASSWORD_{slot}", "")
-
-        # Fall back to unnumbered SNOWFLAKE_ACCOUNT for slot 1 if SNOWFLAKE_ACCOUNT_1 is not set
-        if slot == 1 and (_is_placeholder(acct) or _is_placeholder(user)):
-            acct = os.environ.get("SNOWFLAKE_ACCOUNT", "")
-            user = os.environ.get("SNOWFLAKE_USER", "")
-            pwd = os.environ.get("SNOWFLAKE_PASSWORD", "")
-
+    def _try_add(slot_num: int, acct: str, user: str, pwd: str, role: str, wh: str) -> None:
         if _is_placeholder(acct) or _is_placeholder(user) or _is_placeholder(pwd):
-            continue
-
-        role = os.environ.get(f"SNOWFLAKE_ROLE_{slot}", default_role) or default_role
-        wh = os.environ.get(f"SNOWFLAKE_WAREHOUSE_{slot}", default_wh) or default_wh
+            return
         dedup_key = (acct.strip().lower(), user.strip().lower())
         if dedup_key in seen_keys:
-            continue
+            return
         seen_keys.add(dedup_key)
         accounts.append(
             SnowflakeAccountSpec(
-                slot=slot,
+                slot=slot_num,
                 account=acct.strip(),
                 user=user.strip(),
                 password=pwd.strip(),
-                role=role.strip(),
-                warehouse=wh.strip(),
+                role=(role or default_role).strip(),
+                warehouse=(wh or default_wh).strip(),
             )
         )
+
+    # 1. Check numbered slots 1..16
+    for slot in range(1, 17):
+        acct = os.environ.get(f"SNOWFLAKE_ACCOUNT_{slot}", "")
+        user = os.environ.get(f"SNOWFLAKE_USER_{slot}", "") or os.environ.get(f"SNOWFLAE_USER_{slot}", "")
+        pwd = os.environ.get(f"SNOWFLAKE_PASSWORD_{slot}", "")
+        role = os.environ.get(f"SNOWFLAKE_ROLE_{slot}", default_role)
+        wh = os.environ.get(f"SNOWFLAKE_WAREHOUSE_{slot}", default_wh)
+        _try_add(slot, acct, user, pwd, role, wh)
+
+    # 2. Also check unnumbered SNOWFLAKE_ACCOUNT/USER/PASSWORD (assigning slot 1 if free, else next slot)
+    un_acct = os.environ.get("SNOWFLAKE_ACCOUNT", "")
+    un_user = os.environ.get("SNOWFLAKE_USER", "") or os.environ.get("SNOWFLAE_USER", "")
+    un_pwd = os.environ.get("SNOWFLAKE_PASSWORD", "")
+    used_slots = {a.slot for a in accounts}
+    un_slot = 1 if 1 not in used_slots else (max(used_slots) + 1 if used_slots else 1)
+    _try_add(un_slot, un_acct, un_user, un_pwd, default_role, default_wh)
+
+    accounts.sort(key=lambda a: a.slot)
 
     if requested_slots:
         slot_set = set(requested_slots)
