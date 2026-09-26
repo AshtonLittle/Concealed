@@ -268,7 +268,7 @@ def main() -> None:
         remote_kwargs["pip_requirements"] = ["timm", "onnx", "onnxruntime"]
 
     @remote("CONCEALED_GPU_POOL", **remote_kwargs)
-    def _run_remote_gpu_training(cfg: dict, cached_hf_bundle: str | None) -> dict:
+    def run_concealed_gpu_training(cfg: dict, cached_hf_bundle: str | None) -> dict:
         import os
         from pathlib import Path
         import tarfile
@@ -287,22 +287,24 @@ def main() -> None:
             hf_cache_dir.mkdir(parents=True, exist_ok=True)
             print(f"Downloading staged surrogate weights {cached_hf_bundle} from @MODEL_STAGE ...")
             sp_session.file.get(f"@CONCEALED_DB.PUBLIC.MODEL_STAGE/{cached_hf_bundle}", str(tmp_root))
-            hf_tar = tmp_root / cached_hf_bundle
-            if hf_tar.exists():
-                with tarfile.open(hf_tar, "r") as tar:
+            matches = list(tmp_root.glob(f"{cached_hf_bundle}*"))
+            if matches:
+                with tarfile.open(matches[0], "r:*") as tar:
                     tar.extractall(path=hf_cache_dir)
-                hf_tar.unlink()
+                matches[0].unlink()
             os.environ["HF_HOME"] = str(hf_cache_dir)
+            os.environ["HF_HUB_CACHE"] = str(hf_cache_dir / "hub")
+            os.environ["TRANSFORMERS_CACHE"] = str(hf_cache_dir / "hub")
             os.environ["HF_HUB_OFFLINE"] = "1"
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
         print("Downloading images_bundle.tar from @CONCEALED_DB.PUBLIC.IMAGE_STAGE ...")
         sp_session.file.get("@CONCEALED_DB.PUBLIC.IMAGE_STAGE/images_bundle.tar", str(tmp_root))
-        bundle_file = tmp_root / "images_bundle.tar"
-        if bundle_file.exists():
-            with tarfile.open(bundle_file, "r") as tar:
+        img_matches = list(tmp_root.glob("images_bundle.tar*"))
+        if img_matches:
+            with tarfile.open(img_matches[0], "r:*") as tar:
                 tar.extractall(path=local_imgs)
-            bundle_file.unlink()
+            img_matches[0].unlink()
         else:
             sp_session.file.get("@CONCEALED_DB.PUBLIC.IMAGE_STAGE", str(local_imgs))
 
@@ -319,7 +321,7 @@ def main() -> None:
         return metrics
 
     print(f"[3/4] Submitting GPU training job to CONCEALED_GPU_POOL ({args.gpu_family})...")
-    job = _run_remote_gpu_training(config, hf_bundle_name)
+    job = run_concealed_gpu_training(config, hf_bundle_name)
     print(f"Job dispatched (ID: {job.id}). Waiting for GPU container startup and training completion...")
     try:
         job.wait()
