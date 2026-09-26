@@ -60,13 +60,13 @@ def compute_low_freq_tv_loss(delta: torch.Tensor) -> torch.Tensor:
     delta_chroma = delta - delta_y
     chroma_energy = torch.mean(delta_chroma.pow(2))
 
-    # 3. Anti-UAP mode-collapse penalty across batch dimension
+    # 3. Anti-UAP mode-collapse penalty across batch dimension (penalizes batch-constant gratings)
     uap_penalty = torch.tensor(0.0, device=delta.device, dtype=delta.dtype)
     if delta.shape[0] > 1:
         batch_mean = delta.mean(dim=0, keepdim=True)
-        uap_penalty = torch.mean(batch_mean.pow(2)) / (torch.mean(delta.pow(2)).detach() + 1e-6)
+        uap_penalty = torch.mean(batch_mean.pow(2))
 
-    return 4.0 * low_freq_energy + 3.0 * chroma_energy + 0.15 * uap_penalty
+    return 2.0 * low_freq_energy + 1.5 * chroma_energy + 1.0 * uap_penalty
 
 
 class CompositeObfuscationLoss(nn.Module):
