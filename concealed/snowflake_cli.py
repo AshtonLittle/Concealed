@@ -275,16 +275,28 @@ def main() -> None:
 
         session.sql("USE DATABASE CONCEALED_DB").collect()
         session.sql("USE SCHEMA PUBLIC").collect()
+        df = list_jobs(session=session)
+        if "created_on" in df.columns:
+            df = df.sort_values("created_on", ascending=False)
+
         target_id = args.status
         if target_id == "LATEST":
-            df = list_jobs(session=session)
             if len(df) == 0:
                 print("No Snowflake ML jobs found in CONCEALED_DB.PUBLIC.")
                 return
-            target_id = f"CONCEALED_DB.PUBLIC.{df.iloc[0]['name']}"
+            active_rows = df[df["status"].astype(str).str.upper().isin(["RUNNING", "PENDING", "STARTING", "QUEUED"])]
+            chosen_row = active_rows.iloc[0] if len(active_rows) > 0 else df.iloc[0]
+            target_id = f"CONCEALED_DB.PUBLIC.{chosen_row['name']}"
+
         job = get_job(target_id, session=session)
         print(f"Job ID : {job.id}")
         print(f"Status : {job.status}")
+        if str(job.status).upper() == "CANCELLED" and len(df) > 0:
+            active_rows = df[df["status"].astype(str).str.upper().isin(["RUNNING", "PENDING", "STARTING", "QUEUED"])]
+            if len(active_rows) > 0:
+                active_id = f"CONCEALED_DB.PUBLIC.{active_rows.iloc[0]['name']}"
+                print(f"NOTE   : This old job is CANCELLED. Active job is: {active_id}")
+                print("         Run `concealed-snowflake --status` (with no ID) to view the active job.")
         print("\n--- Latest Container Logs ---")
         job.show_logs()
         return
