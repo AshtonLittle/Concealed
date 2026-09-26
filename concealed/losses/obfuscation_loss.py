@@ -128,7 +128,7 @@ class CompositeObfuscationLoss(nn.Module):
         for clean_out, obf_out in zip(clean_outputs, obf_outputs):
             w = obf_out.weight
             total_weight += w
-            short_name = obf_out.model_name.split("/")[-1]
+            short_name = obf_out.name.split("/")[-1]
 
             # 1. Global [CLS] / pooled cosine similarity repulsion
             clean_glob = clean_out.global_embedding.detach()

@@ -150,7 +150,7 @@ def validate(
             _, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
 
         for c_out, o_out in zip(clean_outputs, obf_outputs):
-            short_name = o_out.model_name.split("/")[-1]
+            short_name = o_out.name.split("/")[-1]
             clean_glob_gallery.setdefault(short_name, []).append(c_out.global_embedding.detach().float().cpu())
             obf_glob_gallery.setdefault(short_name, []).append(o_out.global_embedding.detach().float().cpu())
             if c_out.patch_tokens and o_out.patch_tokens:
