@@ -321,17 +321,16 @@ class AmortizedObfuscationGenerator(nn.Module):
             *[ConvNeXtDepthwiseBlock(c1) for _ in range(blocks)],
         )
 
-        # Perturbation head (outputs unbounded logits before tanh)
+        # Perturbation head (zero-bias to prevent static image-agnostic UAP mode collapse)
         self.head = nn.Sequential(
             nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
             nn.SiLU(inplace=True),
-            nn.Conv2d(c1, 3, kernel_size=3, padding=1, bias=True),
+            nn.Conv2d(c1, 3, kernel_size=3, padding=1, bias=False),
         )
         # Initialize final head with small weights for stable start
-        nn.init.normal_(self.head[-1].weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.head[-1].bias)
+        nn.init.normal_(self.head[-1].weight, mean=0.0, std=0.02)
 
-        self.texture_mask = WeberTextureMask(min_mask_scale=0.55)
+        self.texture_mask = WeberTextureMask(min_mask_scale=0.30)
 
     def set_epsilon_255(self, epsilon_255: float) -> None:
         """Dynamically adjust the L_infinity perturbation bound at inference or training time."""
@@ -356,7 +355,17 @@ class AmortizedObfuscationGenerator(nn.Module):
         d1 = self.up1(d2)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
-        return self.head(d1)
+        raw = self.head(d1)
+
+        # 1. High-pass spatial filter: strip low-frequency (>9px) wavy blobs while preserving
+        # intra-patch (2px-8px) frequencies that resonate with 14x14 and 16x16 ViT patch kernels.
+        raw = raw - F.avg_pool2d(raw, kernel_size=9, stride=1, padding=4)
+
+        # 2. Content-adaptive structural gate: tie perturbation phase/amplitude to input structure
+        # so the generator cannot collapse to a static image-independent background grating.
+        x_hp = (x - F.avg_pool2d(x, kernel_size=7, stride=1, padding=3)).abs().mean(dim=1, keepdim=True)
+        content_gate = 0.65 + 0.70 * torch.tanh(x_hp * 16.0)
+        return raw * content_gate
 
     def _forward_padded(self, x: torch.Tensor) -> torch.Tensor:
         """Pad input to a multiple of 8, run backbone, and crop back to exact (H, W)."""
@@ -391,7 +400,7 @@ class AmortizedObfuscationGenerator(nn.Module):
             raw_global = self._forward_backbone(x_canon)
             raw_global = F.interpolate(raw_global, size=(h, w), mode="bilinear", align_corners=False)
 
-            # 2. High-res tile grid pass (defeats high-res tile-slicing VLMs like GPT-4o / Qwen2-VL)
+            # 2. High-res tile grid pass (defeats high-res tile-slicing VLMs like GPT-4o / Gemini / Qwen2-VL)
             local_s = max(16, (self.tile_size // 8) * 8)
             x_local = F.interpolate(x, size=(local_s, local_s), mode="bilinear", align_corners=False)
             raw_local = self._forward_backbone(x_local)
@@ -403,6 +412,12 @@ class AmortizedObfuscationGenerator(nn.Module):
 
         else:
             raise ValueError(f"Unsupported synthesis mode: {active_mode}")
+
+        # YCbCr Opponent Chrominance Damping:
+        # Suppress magenta/green (+G vs -R/-B) chromatic waves by 70% while keeping full luminance/edge budget.
+        delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
+        delta_chroma = delta - delta_y
+        delta = delta_y + 0.30 * delta_chroma
 
         if self.luminance_texture_masking:
             mask = self.texture_mask(x)

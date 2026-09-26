@@ -340,17 +340,24 @@ def main() -> None:
             config.setdefault("generator", {})["hybrid_global_weight"] = 0.35
 
     if args.poc:
-        print("  -> Fast Proof-of-Concept (--poc) enabled: 1,000 images, 5 epochs, batch_size=12, canonical_residual (256x256)")
-        config.setdefault("generator", {})["mode"] = "canonical_residual"
+        print(
+            "  -> Enhanced Proof-of-Concept (--poc) enabled (~10-12 mins on A10G GPU): "
+            "1,600 images, 15 epochs, batch_size=12, eps=10/255, high-pass anti-collapse mode"
+        )
+        config.setdefault("generator", {})["mode"] = "native"
         config.setdefault("generator", {})["canonical_size"] = 256
+        config.setdefault("generator", {})["epsilon_255"] = 10.0
         config.setdefault("surrogates", {})["sequential_grad_accum"] = False
+        config.setdefault("loss", {})["patch_cosine_weight"] = 3.5
+        config.setdefault("loss", {})["global_cosine_weight"] = 2.0
+        config.setdefault("loss", {})["patch_dispersion_weight"] = 0.8
         config.setdefault("training", {})["train_resolution"] = 256
         config.setdefault("training", {})["batch_size"] = 12
         config.setdefault("training", {})["grad_accumulation_steps"] = 1
-        config.setdefault("training", {})["epochs"] = 5
+        config.setdefault("training", {})["epochs"] = 15
         config.setdefault("training", {})["warmup_epochs"] = 1
-        config.setdefault("training", {})["lr"] = 5.0e-4
-        config.setdefault("training", {})["max_images"] = 1000
+        config.setdefault("training", {})["lr"] = 6.0e-4
+        config.setdefault("training", {})["max_images"] = 1600
 
     if args.max_images is not None:
         config.setdefault("training", {})["max_images"] = args.max_images
@@ -409,7 +416,7 @@ def main() -> None:
         if cached_hf_bundle:
             hf_cache_dir = tmp_root / "hf_cache"
             hf_cache_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Downloading staged surrogate weights {cached_hf_bundle} from @MODEL_STAGE ...")
+            print(f"Downloading staged surrogate weights {cached_hf_bundle} from @MODEL_STAGE ...", flush=True)
             sp_session.file.get(f"@CONCEALED_DB.PUBLIC.MODEL_STAGE/{cached_hf_bundle}", str(tmp_root))
             matches = list(tmp_root.glob(f"{cached_hf_bundle}*"))
             if matches:
@@ -422,7 +429,7 @@ def main() -> None:
             os.environ["HF_HUB_OFFLINE"] = "1"
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-        print("Downloading images_bundle.tar from @CONCEALED_DB.PUBLIC.IMAGE_STAGE ...")
+        print("Downloading images_bundle.tar from @CONCEALED_DB.PUBLIC.IMAGE_STAGE ...", flush=True)
         sp_session.file.get("@CONCEALED_DB.PUBLIC.IMAGE_STAGE/images_bundle.tar", str(tmp_root))
         img_matches = list(tmp_root.glob("images_bundle.tar*"))
         if img_matches:
@@ -432,13 +439,21 @@ def main() -> None:
         else:
             sp_session.file.get("@CONCEALED_DB.PUBLIC.IMAGE_STAGE", str(local_imgs))
 
-        def _sync_epoch_artifacts(_ep: int, out_dir_path: Path, _val_metrics: dict) -> None:
-            for pt_file in ("best_generator.pt", "latest_generator.pt"):
-                p = out_dir_path / pt_file
+        def _sync_epoch_artifacts(ep: int, out_dir_path: Path, _val_metrics: dict) -> None:
+            for fname in ("best_generator.pt", "latest_generator.pt", "training_log.json"):
+                p = out_dir_path / fname
                 if p.exists():
                     sp_session.file.put(
                         str(p), "@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest", auto_compress=False, overwrite=True
                     )
+            sample_p = out_dir_path / "samples" / f"epoch_{ep:03d}.png"
+            if sample_p.exists():
+                sp_session.file.put(
+                    str(sample_p),
+                    "@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/samples",
+                    auto_compress=False,
+                    overwrite=True,
+                )
 
         _, metrics = train(
             config=cfg,
@@ -456,22 +471,65 @@ def main() -> None:
 
     print(f"[3/4] Submitting GPU training job to CONCEALED_GPU_POOL ({args.gpu_family})...")
     job = run_concealed_gpu_training(config, hf_bundle_name)
-    print(f"Job dispatched (ID: {job.id}). Waiting for GPU container startup and training completion...")
+    print(f"Job dispatched (ID: {job.id}). Streaming live container analytics (press Ctrl+C after any epoch to grab latest checkpoint)...")
+
+    import time
+
+    seen_log_lines = 0
+    noise_tokens = (
+        "logger=",
+        "otelcol",
+        "prometheus",
+        "tsdb",
+        "Metric sent (UDP",
+        "UNEXPECTED |",
+        "text_model.",
+        "logit_scale",
+        "logit_bias",
+        "visual_projection",
+        "-------------------------------------------------------------+",
+    )
     try:
-        job.wait()
-    except Exception:
-        print("\n--- Remote Job Logs ---")
-        job.show_logs()
-        raise
-    job.show_logs()
-    metrics = job.result()
-    print(f"Remote GPU training finished! Validation metrics: {metrics}")
+        while True:
+            st = str(job.status).upper()
+            try:
+                lines = job.get_logs(as_list=True)
+                if isinstance(lines, list) and len(lines) > seen_log_lines:
+                    for ln in lines[seen_log_lines:]:
+                        if not any(tok in ln for tok in noise_tokens):
+                            print(ln, flush=True)
+                    seen_log_lines = len(lines)
+            except Exception:
+                pass
+            if st in {"DONE", "FAILED", "CANCELLED", "INTERNAL_ERROR", "DELETED"}:
+                break
+            time.sleep(4.0)
+
+        if st != "DONE":
+            print("\n--- Full Remote Job Logs ---")
+            job.show_logs()
+            raise RuntimeError(f"Snowflake GPU job ended with status: {st}")
+
+        metrics = job.result()
+        print(
+            f"\nRemote GPU training finished! "
+            f"Val Patch Cos: {metrics.get('patch_cos_sim', 0.0):.4f} | "
+            f"Feature ID Evasion: {metrics.get('feature_reid_evasion_pct', 0.0):.1f}% | "
+            f"Semantic Flip: {metrics.get('semantic_neighbor_flip_pct', 0.0):.1f}%"
+        )
+    except KeyboardInterrupt:
+        print("\n[Interrupted] Fetching latest synced checkpoint from @CONCEALED_DB.PUBLIC.MODEL_STAGE/latest ...")
 
     # 4. Download trained checkpoints back to local output_dir and export ONNX locally
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[4/4] Downloading trained checkpoint to {out_dir} and exporting generator.onnx ...")
     session.file.get("@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/", str(out_dir))
+    try:
+        (out_dir / "samples").mkdir(parents=True, exist_ok=True)
+        session.file.get("@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/samples/", str(out_dir / "samples"))
+    except Exception:
+        pass
 
     best_pt = out_dir / "best_generator.pt"
     if best_pt.exists():

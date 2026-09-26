@@ -43,13 +43,30 @@ def compute_ssim_loss(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -
 
 
 def compute_low_freq_tv_loss(delta: torch.Tensor) -> torch.Tensor:
-    """Penalize low-frequency blotches in the perturbation delta while allowing fine patch-grid frequencies."""
-    # Downsample delta with a 4x4 average pool to isolate low-frequency color shifts
-    delta_low = F.avg_pool2d(delta, kernel_size=4, stride=2, padding=1)
-    tv_h = torch.mean(torch.abs(delta_low[:, :, 1:, :] - delta_low[:, :, :-1, :]))
-    tv_w = torch.mean(torch.abs(delta_low[:, :, :, 1:] - delta_low[:, :, :, :-1]))
-    dc_energy = torch.mean(delta_low.pow(2))
-    return tv_h + tv_w + 2.0 * dc_energy
+    """Suppress multi-scale low-frequency blotches and opponent purple/green chrominance waves.
+
+    Unlike standard pixel TV (which blurs fine textures into wide waves), this penalizes:
+      1. 8x8 and 16x16 pooled low-frequency energy (blocking wide stripes/bands)
+      2. YCbCr opponent chrominance energy (blocking magenta/green +G/-R-B color casts)
+      3. Batch-mean UAP collapse (forcing perturbations to be content-adaptive per image)
+    """
+    # 1. Multi-scale low-frequency energy suppression (blocks >=8px and >=16px waves)
+    low_8 = F.avg_pool2d(delta, kernel_size=8, stride=4, padding=2)
+    low_16 = F.avg_pool2d(delta, kernel_size=16, stride=8, padding=4)
+    low_freq_energy = torch.mean(low_8.pow(2)) + 2.5 * torch.mean(low_16.pow(2))
+
+    # 2. Opponent chrominance suppression in YCbCr space
+    delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
+    delta_chroma = delta - delta_y
+    chroma_energy = torch.mean(delta_chroma.pow(2))
+
+    # 3. Anti-UAP mode-collapse penalty across batch dimension
+    uap_penalty = torch.tensor(0.0, device=delta.device, dtype=delta.dtype)
+    if delta.shape[0] > 1:
+        batch_mean = delta.mean(dim=0, keepdim=True)
+        uap_penalty = torch.mean(batch_mean.pow(2)) / (torch.mean(delta.pow(2)).detach() + 1e-6)
+
+    return 4.0 * low_freq_energy + 3.0 * chroma_energy + 0.15 * uap_penalty
 
 
 class CompositeObfuscationLoss(nn.Module):
@@ -94,50 +111,90 @@ class CompositeObfuscationLoss(nn.Module):
         clean_outputs: List[SurrogateOutput],
         obf_outputs: List[SurrogateOutput],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute weighted multi-surrogate ViT feature disruption loss."""
-        total_patch_cos = torch.tensor(0.0, device=obf_outputs[0].global_embedding.device)
-        total_global_cos = torch.tensor(0.0, device=obf_outputs[0].global_embedding.device)
-        total_dispersion = torch.tensor(0.0, device=obf_outputs[0].global_embedding.device)
+        """Compute salience-weighted multi-surrogate ViT feature disruption loss and identification metrics."""
+        device = obf_outputs[0].global_embedding.device
+        total_patch_cos = torch.tensor(0.0, device=device)
+        total_global_cos = torch.tensor(0.0, device=device)
+        total_dispersion = torch.tensor(0.0, device=device)
         total_weight = 0.0
 
         raw_patch_cos_sum = 0.0
+        raw_salient_cos_sum = 0.0
         raw_global_cos_sum = 0.0
+        concealed_patches_50_sum = 0.0
+        concealed_patches_70_sum = 0.0
+        per_model_metrics: Dict[str, float] = {}
 
         for clean_out, obf_out in zip(clean_outputs, obf_outputs):
             w = obf_out.weight
             total_weight += w
+            short_name = obf_out.model_name.split("/")[-1]
 
             # 1. Global [CLS] / pooled cosine similarity repulsion
-            # Both embeddings are already L2-normalized [B, D]
-            global_cos = (clean_out.global_embedding.detach() * obf_out.global_embedding).sum(dim=-1).mean()
-            raw_global_cos_sum += float(global_cos.detach().item()) * w
+            clean_glob = clean_out.global_embedding.detach()
+            obf_glob = obf_out.global_embedding
+            global_cos = (clean_glob * obf_glob).sum(dim=-1).mean()
+            g_cos_val = float(global_cos.detach().item())
+            raw_global_cos_sum += g_cos_val * w
+            per_model_metrics[f"global_cos/{short_name}"] = g_cos_val
+
             global_loss = F.relu(global_cos - self.cosine_margin)
             total_global_cos = total_global_cos + w * global_loss
 
-            # 2. Multi-layer spatial patch token cosine repulsion & spatial dispersion collapse
+            # 2. Multi-layer spatial patch token cosine repulsion & relational scrambling
             if obf_out.patch_tokens and clean_out.patch_tokens:
                 layer_cos_losses = []
                 layer_disp_losses = []
                 layer_raw_cos = []
-                for clean_patches, obf_patches in zip(clean_out.patch_tokens, obf_out.patch_tokens):
-                    # [B, N, D] dot product per spatial patch
-                    patch_cos = (clean_patches.detach() * obf_patches).sum(dim=-1).mean()
-                    layer_raw_cos.append(float(patch_cos.detach().item()))
-                    layer_cos_losses.append(F.relu(patch_cos - self.cosine_margin))
+                layer_salient_cos = []
+                layer_conc_50 = []
+                layer_conc_70 = []
 
-                    # Spatial dispersion loss: push spatial patches toward their mean (uniformity collapse)
-                    # or scramble spatial covariance so self-attention loses object boundaries
-                    spatial_mean = F.normalize(obf_patches.mean(dim=1, keepdim=True), p=2, dim=-1)
-                    # Penalize patches for retaining distinct structured variance aligned with clean image
-                    clean_centered = clean_patches.detach() - clean_patches.detach().mean(dim=1, keepdim=True)
+                for clean_patches, obf_patches in zip(clean_out.patch_tokens, obf_out.patch_tokens):
+                    cp = clean_patches.detach()
+                    # Per-patch cosine similarity [B, N]
+                    per_patch_cos = (cp * obf_patches).sum(dim=-1)
+                    mean_patch_cos = per_patch_cos.mean()
+                    layer_raw_cos.append(float(mean_patch_cos.detach().item()))
+
+                    # Estimate foreground patch salience from alignment with clean global semantics + patch variance
+                    cp_centered = cp - cp.mean(dim=1, keepdim=True)
+                    patch_distinctiveness = cp_centered.norm(dim=-1)  # [B, N]
+                    salience_weights = torch.softmax(patch_distinctiveness * 3.0, dim=-1) * cp.shape[1]
+                    salient_weighted_cos = (per_patch_cos * salience_weights.detach()).mean()
+
+                    # Top-25% most salient foreground patches (faces, objects, text)
+                    k_top = max(1, cp.shape[1] // 4)
+                    top_idx = torch.topk(patch_distinctiveness, k=k_top, dim=-1).indices
+                    top_patch_cos = torch.gather(per_patch_cos.detach(), 1, top_idx).mean()
+                    layer_salient_cos.append(float(top_patch_cos.item()))
+
+                    # Percentage of patches disrupted below recognition thresholds (0.50 and 0.70)
+                    layer_conc_50.append(float((per_patch_cos.detach() < 0.50).float().mean().item() * 100.0))
+                    layer_conc_70.append(float((per_patch_cos.detach() < 0.70).float().mean().item() * 100.0))
+
+                    # Combine uniform + salience-focused patch repulsion
+                    combined_patch_cos = 0.4 * mean_patch_cos + 0.6 * salient_weighted_cos
+                    layer_cos_losses.append(F.relu(combined_patch_cos - self.cosine_margin))
+
+                    # Spatial relational / covariance disruption: break self-attention grouping of objects
                     obf_centered = obf_patches - obf_patches.mean(dim=1, keepdim=True)
-                    cov_align = F.cosine_similarity(clean_centered, obf_centered, dim=-1).mean()
+                    cov_align = F.cosine_similarity(cp_centered, obf_centered, dim=-1).mean()
+                    spatial_mean = F.normalize(obf_patches.mean(dim=1, keepdim=True), p=2, dim=-1)
                     uniform_sim = (obf_patches * spatial_mean).sum(dim=-1).mean()
-                    layer_disp_losses.append(F.relu(cov_align) + (1.0 - uniform_sim) * 0.25)
+                    layer_disp_losses.append(F.relu(cov_align - self.cosine_margin) + (1.0 - uniform_sim) * 0.25)
 
                 total_patch_cos = total_patch_cos + w * torch.stack(layer_cos_losses).mean()
                 total_dispersion = total_dispersion + w * torch.stack(layer_disp_losses).mean()
-                raw_patch_cos_sum += (sum(layer_raw_cos) / len(layer_raw_cos)) * w
+
+                m_p_cos = sum(layer_raw_cos) / len(layer_raw_cos)
+                m_s_cos = sum(layer_salient_cos) / len(layer_salient_cos)
+                raw_patch_cos_sum += m_p_cos * w
+                raw_salient_cos_sum += m_s_cos * w
+                concealed_patches_50_sum += (sum(layer_conc_50) / len(layer_conc_50)) * w
+                concealed_patches_70_sum += (sum(layer_conc_70) / len(layer_conc_70)) * w
+                per_model_metrics[f"patch_cos/{short_name}"] = m_p_cos
+                per_model_metrics[f"salient_cos/{short_name}"] = m_s_cos
 
         norm = max(total_weight, 1e-6)
         patch_loss = total_patch_cos / norm
@@ -151,8 +208,12 @@ class CompositeObfuscationLoss(nn.Module):
         )
         metrics = {
             "patch_cos_sim": raw_patch_cos_sum / norm,
+            "salient_patch_cos": raw_salient_cos_sum / norm,
             "global_cos_sim": raw_global_cos_sum / norm,
+            "concealed_patches_50_pct": concealed_patches_50_sum / norm,
+            "concealed_patches_70_pct": concealed_patches_70_sum / norm,
             "surrogate_loss": float(surrogate_loss.detach().item()),
+            **per_model_metrics,
         }
         return surrogate_loss, metrics
 
@@ -177,11 +238,22 @@ class CompositeObfuscationLoss(nn.Module):
             lpips_val = float(lp.detach().item())
             stealth_loss = stealth_loss + self.lpips_weight * lp
 
+        # Measure opponent chrominance shift in [0, 255] units and UAP collapse ratio
+        delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
+        chroma_rms_255 = float((delta - delta_y).pow(2).mean().sqrt().detach().item() * 255.0)
+        uap_ratio = 0.0
+        if delta.shape[0] > 1:
+            uap_ratio = float(
+                (delta.mean(dim=0).pow(2).mean() / (delta.pow(2).mean() + 1e-6)).detach().item()
+            )
+
         metrics = {
             "ssim_loss": float(ssim_loss.detach().item()),
             "low_freq_tv_loss": float(tv_loss.detach().item()),
             "lpips_loss": lpips_val,
             "stealth_loss": float(stealth_loss.detach().item()),
+            "chroma_rms_255": chroma_rms_255,
+            "uap_collapse_ratio": uap_ratio,
         }
         return stealth_loss, metrics
 

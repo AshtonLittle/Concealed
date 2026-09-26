@@ -209,6 +209,232 @@ class RealtimeObfuscator:
         }
 
 
+    def refine_tensor(
+        self,
+        x_clean: torch.Tensor,
+        x_init: torch.Tensor,
+        steps: int = 15,
+        epsilon_255: Optional[float] = None,
+        surrogate_names: Optional[list[str]] = None,
+    ) -> torch.Tensor:
+        """Hybrid test-time refinement: warm-start from generator output and run high-pass edge-masked ViT repulsion."""
+        import torch.nn.functional as F
+        from concealed.models.generator import WeberTextureMask
+        from concealed.models.surrogates import VisionTransformerSurrogate
+
+        squeeze = False
+        if x_clean.ndim == 3:
+            x_clean = x_clean.unsqueeze(0)
+            x_init = x_init.unsqueeze(0)
+            squeeze = True
+
+        dev = self.device
+        x_c = x_clean.to(dev).float()
+        x_0 = x_init.to(dev).float()
+        eps = float(epsilon_255 if epsilon_255 is not None else (self.generator.epsilon_255 if self.generator else 10.0)) / 255.0
+
+        names = surrogate_names or ["timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k"]
+        models = [VisionTransformerSurrogate(n, tap_layers=(-3, -2, -1)).to(dev).eval() for n in names]
+        weber = WeberTextureMask(min_mask_scale=0.30).to(dev)
+
+        h, w = x_c.shape[-2], x_c.shape[-1]
+        with torch.no_grad():
+            tex_mask = weber(x_c)
+            clean_targets = [m(x_c) for m in models]
+
+        # Parameterize directly at ViT canonical scale (224x224) + mid-scale (384x384) to avoid downsample gradient dilution
+        init_delta = (x_0 - x_c).clamp(-eps * 0.99, eps * 0.99)
+        init_224 = F.interpolate(init_delta, size=(224, 224), mode="bilinear", align_corners=False)
+        init_384 = F.interpolate(init_delta, size=(384, 384), mode="bilinear", align_corners=False)
+        param_224 = torch.atanh((init_224 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone().requires_grad_(True)
+        param_384 = torch.atanh((init_384 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone().requires_grad_(True)
+        opt = torch.optim.Adam([param_224, param_384], lr=0.25)
+
+        def _synthesize_delta() -> torch.Tensor:
+            # High-pass filter at both 224 and 384 scales so no wide (>9px) wavy bands can form
+            hp_224 = param_224 - F.avg_pool2d(param_224, kernel_size=9, stride=1, padding=4)
+            hp_384 = param_384 - F.avg_pool2d(param_384, kernel_size=9, stride=1, padding=4)
+            up_224 = F.interpolate(hp_224, size=(h, w), mode="bilinear", align_corners=False)
+            up_384 = F.interpolate(hp_384, size=(h, w), mode="bilinear", align_corners=False)
+            raw = 0.65 * up_224 + 0.35 * up_384
+            d = eps * torch.tanh(raw)
+            # YCbCr chrominance damping (suppresses magenta/green waves by 70%)
+            d_y = 0.299 * d[:, 0:1] + 0.587 * d[:, 1:2] + 0.114 * d[:, 2:3]
+            d = (d_y + 0.30 * (d - d_y)) * tex_mask
+            return torch.clamp(d, -eps, eps)
+
+        print(f"\n--- Running Hybrid High-Pass ViT Refinement ({steps} steps, eps={eps * 255:.1f}/255) ---", flush=True)
+        for step in range(1, steps + 1):
+            opt.zero_grad()
+            delta = _synthesize_delta()
+            x_adv = torch.clamp(x_c + delta, 0.0, 1.0)
+
+            total_loss = torch.tensor(0.0, device=dev)
+            p_cos_list = []
+            s_cos_list = []
+            g_cos_list = []
+            c50_list = []
+
+            for m, c_out in zip(models, clean_targets):
+                o_out = m(x_adv)
+                g_cos = (c_out.global_embedding.detach() * o_out.global_embedding).sum(dim=-1).mean()
+                g_cos_list.append(float(g_cos.detach().item()))
+                total_loss = total_loss + 2.5 * g_cos
+
+                for cp, op in zip(c_out.patch_tokens, o_out.patch_tokens):
+                    cp_d = cp.detach()
+                    per_p = (cp_d * op).sum(dim=-1)
+                    p_cos_list.append(float(per_p.mean().detach().item()))
+                    c50_list.append(float((per_p.detach() < 0.50).float().mean().item() * 100.0))
+
+                    # Salience-weighted foreground attack
+                    cp_cent = cp_d - cp_d.mean(dim=1, keepdim=True)
+                    sal = cp_cent.norm(dim=-1)
+                    sal_w = torch.softmax(sal * 3.0, dim=-1) * cp_d.shape[1]
+                    total_loss = total_loss + 3.5 * (per_p * sal_w).mean()
+
+                    k_top = max(1, cp_d.shape[1] // 4)
+                    top_idx = torch.topk(sal, k=k_top, dim=-1).indices
+                    s_cos_list.append(float(torch.gather(per_p.detach(), 1, top_idx).mean().item()))
+
+            total_loss.backward()
+            opt.step()
+
+            if step == 1 or step % max(1, steps // 5) == 0 or step == steps:
+                print(
+                    f"  [Step {step:02d}/{steps:02d}] "
+                    f"PatchCos={np.mean(p_cos_list):.4f} | "
+                    f"SalientForegroundCos={np.mean(s_cos_list):.4f} | "
+                    f"GlobalCos={np.mean(g_cos_list):.4f} | "
+                    f"ConcealedPatches(<0.5)={np.mean(c50_list):.1f}%",
+                    flush=True,
+                )
+
+        with torch.no_grad():
+            delta = _synthesize_delta()
+            x_final = torch.clamp(x_c + delta, 0.0, 1.0).to(x_clean.device)
+
+        return x_final.squeeze(0) if squeeze else x_final
+
+    @torch.no_grad()
+    def analyze_image_pair(
+        self,
+        clean_pil: Image.Image,
+        obf_pil: Image.Image,
+        eval_models: Optional[list[str]] = None,
+    ) -> Dict[str, object]:
+        """Compute and print a comprehensive ViT Feature Identification & Visual Stealth Analytics report."""
+        import math
+        from concealed.losses.obfuscation_loss import compute_ssim_loss
+        from concealed.models.surrogates import VisionTransformerSurrogate
+
+        clean_np = np.asarray(clean_pil.convert("RGB"), dtype=np.float32) / 255.0
+        obf_np = np.asarray(obf_pil.convert("RGB"), dtype=np.float32) / 255.0
+        x_c = torch.from_numpy(clean_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        x_o = torch.from_numpy(obf_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        delta = x_o - x_c
+
+        mse = float(delta.pow(2).mean().item())
+        psnr_db = 10.0 * math.log10(1.0 / max(mse, 1e-10))
+        ssim_val = 1.0 - float(compute_ssim_loss(x_c, x_o).item())
+        linf_255 = float(delta.abs().max().item() * 255.0)
+        rmse_255 = float(math.sqrt(mse) * 255.0)
+        delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
+        chroma_rms_255 = float((delta - delta_y).pow(2).mean().sqrt().item() * 255.0)
+
+        model_list = eval_models or ["timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k"]
+        model_reports = []
+
+        for mname in model_list:
+            sur = VisionTransformerSurrogate(mname, tap_layers=(-3, -2, -1)).to(self.device).eval()
+            c_out = sur(x_c)
+            o_out = sur(x_o)
+
+            g_cos = float((c_out.global_embedding * o_out.global_embedding).sum(dim=-1).mean().item())
+            p_cos_layers = []
+            s_cos_layers = []
+            c70_layers = []
+            c50_layers = []
+            patch_reid_evasion_layers = []
+            salient_displacement_layers = []
+
+            for cp, op in zip(c_out.patch_tokens, o_out.patch_tokens):
+                per_p = (cp * op).sum(dim=-1)  # [1, N]
+                p_cos_layers.append(float(per_p.mean().item()))
+                c70_layers.append(float((per_p < 0.70).float().mean().item() * 100.0))
+                c50_layers.append(float((per_p < 0.50).float().mean().item() * 100.0))
+
+                sal_c = (cp - cp.mean(dim=1, keepdim=True)).norm(dim=-1)
+                sal_o = (op - op.mean(dim=1, keepdim=True)).norm(dim=-1)
+                k_top = max(1, cp.shape[1] // 4)
+                top_c_idx = torch.topk(sal_c, k=k_top, dim=-1).indices
+                top_o_idx = torch.topk(sal_o, k=k_top, dim=-1).indices
+                s_cos_layers.append(float(torch.gather(per_p, 1, top_c_idx).mean().item()))
+
+                # 1. Patch-to-Patch Re-ID Evasion (% of spatial patches that no longer self-match in the 196-patch grid)
+                sim_grid = torch.matmul(op[0], cp[0].T)  # [N, N]
+                matched_idx = torch.argmax(sim_grid, dim=-1)
+                true_idx = torch.arange(cp.shape[1], device=cp.device)
+                evaded_patches = (matched_idx != true_idx) | (per_p[0] < 0.50)
+                patch_reid_evasion_layers.append(float(evaded_patches.float().mean().item() * 100.0))
+
+                # 2. Salient Foreground Attention Displacement (% of top-25% foreground patches displaced)
+                c_set = set(top_c_idx[0].cpu().tolist())
+                o_set = set(top_o_idx[0].cpu().tolist())
+                displaced_pct = (1.0 - len(c_set.intersection(o_set)) / max(1, len(c_set))) * 100.0
+                salient_displacement_layers.append(float(displaced_pct))
+
+            mean_s_cos = float(np.mean(s_cos_layers))
+            mean_reid_ev = float(np.mean(patch_reid_evasion_layers))
+            mean_disp = float(np.mean(salient_displacement_layers))
+
+            model_reports.append(
+                {
+                    "model": mname.split("/")[-1],
+                    "patch_cos": round(float(np.mean(p_cos_layers)), 4),
+                    "salient_patch_cos": round(mean_s_cos, 4),
+                    "global_cos": round(g_cos, 4),
+                    "concealed_patches_70_pct": round(float(np.mean(c70_layers)), 1),
+                    "concealed_patches_50_pct": round(float(np.mean(c50_layers)), 1),
+                    "patch_reid_evasion_pct": round(mean_reid_ev, 1),
+                    "salient_displacement_pct": round(mean_disp, 1),
+                    "identification_evaded": bool(mean_reid_ev >= 50.0 or mean_s_cos < 0.50 or g_cos < 0.45),
+                }
+            )
+
+        print(
+            f"\n+=======================================================================================+\n"
+            f"| CONCEALED IMAGE OBFUSCATION & IDENTIFICATION ANALYTICS REPORT\n"
+            f"+=======================================================================================+\n"
+            f"| Resolution     : {clean_pil.size[0]}x{clean_pil.size[1]}\n"
+            f"| Visual Stealth : PSNR = {psnr_db:.2f} dB | SSIM = {ssim_val:.4f} | L_inf = {linf_255:.2f}/255 | RMSE = {rmse_255:.2f}/255\n"
+            f"| Color Purity   : Opponent Chroma Shift = {chroma_rms_255:.2f}/255 (Low = no purple/green tint)\n"
+            f"+---------------------------------------------------------------------------------------+\n"
+            f"| Vision Transformer Feature & Identification Breakdown:",
+            flush=True,
+        )
+        for rep in model_reports:
+            status_str = "EVADED / SCRAMBLED" if rep["identification_evaded"] else "PARTIALLY DISRUPTED"
+            print(
+                f"|  * {rep['model']}\n"
+                f"|      Patch Cosine Sim        : {rep['patch_cos']:.4f}  (Salient Foreground Faces/Objects: {rep['salient_patch_cos']:.4f})\n"
+                f"|      Global [CLS] Cosine Sim : {rep['global_cos']:.4f}\n"
+                f"|      Concealed Spatial Grid  : {rep['concealed_patches_70_pct']:5.1f}% (<0.70 sim) | {rep['concealed_patches_50_pct']:5.1f}% (<0.50 sim)\n"
+                f"|      Feature Re-ID Evasion   : {rep['patch_reid_evasion_pct']:5.1f}% of patch features misidentified | {rep['salient_displacement_pct']:5.1f}% salient focus displaced\n"
+                f"|      Identification Status   : [{status_str}]",
+                flush=True,
+            )
+        print("+=======================================================================================+\n", flush=True)
+
+        return {
+            "psnr_db": round(psnr_db, 2),
+            "ssim": round(ssim_val, 4),
+            "linf_255": round(linf_255, 2),
+            "chroma_rms_255": round(chroma_rms_255, 2),
+            "models": model_reports,
+        }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real-time Image / Video Obfuscation Pipeline")
     parser.add_argument("--model", type=str, required=True, help="Path to .pt checkpoint or .onnx model")
@@ -222,6 +448,22 @@ def main() -> None:
         help="Override synthesis mode",
     )
     parser.add_argument("--epsilon", type=float, default=None, help="Override epsilon_255 perturbation bound")
+    parser.add_argument(
+        "--refine-steps",
+        type=int,
+        default=0,
+        help="Optional hybrid test-time ViT feature refinement steps on top of generator pass (e.g. 15)",
+    )
+    parser.add_argument(
+        "--no-analytics",
+        action="store_true",
+        help="Skip printing the ViT feature identification analytics report after single-image obfuscation",
+    )
+    parser.add_argument(
+        "--save-comparison",
+        action="store_true",
+        help="Save a side-by-side [Original | Obfuscated | 10x Perturbation Map] image next to --output",
+    )
     parser.add_argument("--device", type=str, default=None, help="Compute device (cuda or cpu)")
     parser.add_argument("--benchmark", action="store_true", help="Run real-time latency & FPS benchmark")
     parser.add_argument(
@@ -243,15 +485,41 @@ def main() -> None:
 
     if args.input and args.output:
         in_path = Path(args.input)
+        out_path = Path(args.output)
         if in_path.is_dir():
-            count = obfuscator.obfuscate_directory(in_path, args.output)
-            print(f"Obfuscated {count} images -> {args.output}")
+            count = obfuscator.obfuscate_directory(in_path, out_path)
+            print(f"Obfuscated {count} images -> {out_path}")
         elif in_path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}:
-            stats = obfuscator.obfuscate_video(in_path, args.output)
-            print(f"Obfuscated video -> {args.output}: {json.dumps(stats)}")
+            stats = obfuscator.obfuscate_video(in_path, out_path)
+            print(f"Obfuscated video -> {out_path}: {json.dumps(stats)}")
         else:
-            obfuscator.obfuscate_file(in_path, args.output)
-            print(f"Obfuscated image -> {args.output}")
+            clean_pil = Image.open(in_path).convert("RGB")
+            rgb = np.array(clean_pil, dtype=np.uint8, copy=True)
+            tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0)
+            obf_tensor = obfuscator.obfuscate_tensor(tensor)
+
+            if args.refine_steps > 0:
+                obf_tensor = obfuscator.refine_tensor(
+                    tensor, obf_tensor, steps=args.refine_steps, epsilon_255=args.epsilon
+                )
+
+            obf_np = (obf_tensor.detach().cpu().permute(1, 2, 0).numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+            obf_pil = Image.fromarray(obf_np)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            obf_pil.save(out_path, quality=95)
+            print(f"Obfuscated image -> {out_path}")
+
+            if args.save_comparison:
+                clean_f = np.asarray(clean_pil, dtype=np.float32) / 255.0
+                obf_f = np.asarray(obf_pil, dtype=np.float32) / 255.0
+                diff_10x = np.clip(np.abs(obf_f - clean_f) * 10.0, 0.0, 1.0)
+                comp = np.concatenate([clean_f, obf_f, diff_10x], axis=1)
+                comp_path = out_path.with_name(f"{out_path.stem}_comparison.png")
+                Image.fromarray((comp * 255.0).astype(np.uint8)).save(comp_path)
+                print(f"Saved visual comparison -> {comp_path}")
+
+            if not args.no_analytics:
+                obfuscator.analyze_image_pair(clean_pil, obf_pil)
 
     if args.benchmark:
         stats = obfuscator.benchmark(resolution=(args.bench_res[0], args.bench_res[1]))

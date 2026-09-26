@@ -108,8 +108,10 @@ def load_generator_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt.get("config", {})
     generator = build_generator(config)
-    state_dict = ckpt.get("generator_state_dict", ckpt)
-    generator.load_state_dict(state_dict, strict=True)
+    raw_sd = ckpt.get("generator_state_dict", ckpt)
+    target_sd = generator.state_dict()
+    filtered_sd = {k: v for k, v in raw_sd.items() if k in target_sd and target_sd[k].shape == v.shape}
+    generator.load_state_dict(filtered_sd, strict=False)
     if override_mode is not None:
         generator.mode = override_mode  # type: ignore[assignment]
     if override_epsilon_255 is not None:
@@ -127,11 +129,17 @@ def validate(
     device: torch.device,
     sample_out_path: Optional[Path] = None,
 ) -> Dict[str, float]:
-    """Run validation over val_loader and compute mean obfuscation & stealth metrics."""
+    """Run validation over val_loader and compute mean obfuscation, stealth, and feature identification metrics."""
     generator.eval()
     accum: Dict[str, float] = {}
     count = 0
     use_amp = device.type == "cuda"
+
+    # Collect embeddings across the validation gallery to measure real Feature Identification & Semantic Flip rates
+    clean_glob_gallery: Dict[str, list] = {}
+    obf_glob_gallery: Dict[str, list] = {}
+    clean_patch_gallery: Dict[str, list] = {}
+    obf_patch_gallery: Dict[str, list] = {}
 
     for batch_idx, x_clean in enumerate(val_loader):
         x_clean = x_clean.to(device, non_blocking=True)
@@ -140,6 +148,17 @@ def validate(
             clean_outputs = surrogates(x_clean)
             obf_outputs = surrogates(x_obf)
             _, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
+
+        for c_out, o_out in zip(clean_outputs, obf_outputs):
+            short_name = o_out.model_name.split("/")[-1]
+            clean_glob_gallery.setdefault(short_name, []).append(c_out.global_embedding.detach().float().cpu())
+            obf_glob_gallery.setdefault(short_name, []).append(o_out.global_embedding.detach().float().cpu())
+            if c_out.patch_tokens and o_out.patch_tokens:
+                # Pool final tapped layer's patch tokens into a spatial-structural descriptor
+                cp_desc = torch.nn.functional.normalize(c_out.patch_tokens[-1].detach().float().mean(dim=1), p=2, dim=-1)
+                op_desc = torch.nn.functional.normalize(o_out.patch_tokens[-1].detach().float().mean(dim=1), p=2, dim=-1)
+                clean_patch_gallery.setdefault(short_name, []).append(cp_desc.cpu())
+                obf_patch_gallery.setdefault(short_name, []).append(op_desc.cpu())
 
         # Compute PSNR in dB
         mse = torch.mean((x_clean.float() - x_obf.float()) ** 2).item()
@@ -154,7 +173,51 @@ def validate(
         if batch_idx == 0 and sample_out_path is not None:
             save_visual_comparison(x_clean.float(), x_obf.float(), delta.float(), sample_out_path)
 
-    return {k: v / max(count, 1) for k, v in accum.items()}
+    summary = {k: v / max(count, 1) for k, v in accum.items()}
+
+    # Compute Gallery Feature Identification Evasion (%) and Semantic Neighbor Flip Rate (%) per Vision Transformer
+    reid_evasion_list = []
+    sem_flip_list = []
+    for short_name, c_list in clean_glob_gallery.items():
+        c_mat = torch.cat(c_list, dim=0)  # [N, D]
+        o_mat = torch.cat(obf_glob_gallery[short_name], dim=0)  # [N, D]
+        if short_name in clean_patch_gallery and clean_patch_gallery[short_name]:
+            cp_mat = torch.cat(clean_patch_gallery[short_name], dim=0)
+            op_mat = torch.cat(obf_patch_gallery[short_name], dim=0)
+            c_joint = torch.nn.functional.normalize(0.5 * c_mat + 0.5 * cp_mat, p=2, dim=-1)
+            o_joint = torch.nn.functional.normalize(0.5 * o_mat + 0.5 * op_mat, p=2, dim=-1)
+        else:
+            c_joint, o_joint = c_mat, o_mat
+
+        n_gal = c_joint.shape[0]
+        sim_obf_to_clean = torch.matmul(o_joint, c_joint.T)  # [N, N]
+        diag_sim = torch.diag(sim_obf_to_clean)  # Self-similarity [N]
+        top1_match = torch.argmax(sim_obf_to_clean, dim=-1)
+        arange_idx = torch.arange(n_gal)
+
+        # Feature Identification Evaded if Top-1 match flips to a different image OR self-similarity drops < 0.65
+        evaded = (top1_match != arange_idx) | (diag_sim < 0.65)
+        evasion_pct = float(evaded.float().mean().item() * 100.0)
+        summary[f"reid_evasion_pct/{short_name}"] = evasion_pct
+        reid_evasion_list.append(evasion_pct)
+
+        # Semantic Neighbor Flip Rate: does the nearest non-self neighbor in the gallery change?
+        if n_gal > 2:
+            sim_clean_to_clean = torch.matmul(c_joint, c_joint.T)
+            eye_mask = torch.eye(n_gal, dtype=torch.bool)
+            sim_clean_no_self = sim_clean_to_clean.masked_fill(eye_mask, -2.0)
+            sim_obf_no_self = sim_obf_to_clean.masked_fill(eye_mask, -2.0)
+            nn_clean = torch.argmax(sim_clean_no_self, dim=-1)
+            nn_obf = torch.argmax(sim_obf_no_self, dim=-1)
+            flip_pct = float((nn_clean != nn_obf).float().mean().item() * 100.0)
+        else:
+            flip_pct = evasion_pct
+        summary[f"semantic_flip_pct/{short_name}"] = flip_pct
+        sem_flip_list.append(flip_pct)
+
+    summary["feature_reid_evasion_pct"] = sum(reid_evasion_list) / max(len(reid_evasion_list), 1)
+    summary["semantic_neighbor_flip_pct"] = sum(sem_flip_list) / max(len(sem_flip_list), 1)
+    return summary
 
 
 def train(
@@ -163,7 +226,7 @@ def train(
     output_dir: str | Path,
     device_str: Optional[str] = None,
     pretrained_surrogates: bool = True,
-    on_epoch_end: Optional[ object ] = None,
+    on_epoch_end: Optional[object] = None,
 ) -> Tuple[AmortizedObfuscationGenerator, Dict[str, float]]:
     """Execute end-to-end training of the Amortized Obfuscation Generator."""
     train_cfg = config.get("training", {})
@@ -243,6 +306,19 @@ def train(
     best_patch_cos = float("inf")
     last_val_metrics: Dict[str, float] = {}
     history = []
+    train_start_time = time.perf_counter()
+    model_short_names = [s.model_name.split("/")[-1] for s in surrogates.surrogates]
+
+    print(
+        f"\n=== Concealed Training Started ===\n"
+        f"  Device     : {device} (AMP: {use_amp})\n"
+        f"  Dataset    : {len(train_loader.dataset)} train / {len(val_loader.dataset)} val images @ {resolution}x{resolution}\n"
+        f"  Generator  : variant={generator.variant}, mode={generator.mode}, eps={generator.epsilon_255:.1f}/255\n"
+        f"  Surrogates : {', '.join(model_short_names)}\n"
+        f"  Schedule   : {epochs} epochs x {len(train_loader)} steps/epoch (batch_size={batch_size}, lr={lr})\n"
+        f"==================================\n",
+        flush=True,
+    )
 
     for epoch in range(1, epochs + 1):
         generator.train()
@@ -250,16 +326,13 @@ def train(
         epoch_metrics: Dict[str, float] = {}
         step_count = 0
         t0 = time.perf_counter()
+        log_every = max(1, len(train_loader) // 4)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
         for idx, x_clean in enumerate(pbar):
             x_clean = x_clean.to(device, non_blocking=True)
 
             if (seq_grad_accum or cpu_offload) and len(surrogates.surrogates) > 1:
-                # In-VRAM Sequential Surrogate Backward:
-                # Keeps all surrogate weights on GPU (unless cpu_offload=True), but evaluates and
-                # backpropagates one surrogate at a time into `x_obf_aug_leaf` so intermediate activation
-                # graphs are 100% freed immediately after each model without needing retain_graph=True.
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     x_obf, delta = generator(x_clean, return_delta=True)
                     x_clean_aug, x_obf_aug = eot(x_clean, x_obf)
@@ -267,9 +340,7 @@ def train(
                 x_obf_aug_leaf = x_obf_aug.detach().requires_grad_(True)
 
                 total_w = sum(s.weight for s in surrogates.surrogates) or 1.0
-                agg_patch_cos = 0.0
-                agg_glob_cos = 0.0
-                agg_sur_loss = 0.0
+                agg_sur_metrics: Dict[str, float] = {}
 
                 for s_mod in surrogates.surrogates:
                     if cpu_offload and device.type == "cuda":
@@ -285,25 +356,24 @@ def train(
                         s_mod.to("cpu")
 
                     w_ratio = s_mod.weight / total_w
-                    agg_patch_cos += s_metrics["patch_cos_sim"] * w_ratio
-                    agg_glob_cos += s_metrics["global_cos_sim"] * w_ratio
-                    agg_sur_loss += s_metrics["surrogate_loss"] * w_ratio
+                    for mk, mv in s_metrics.items():
+                        if "/" in mk:
+                            agg_sur_metrics[mk] = mv
+                        else:
+                            agg_sur_metrics[mk] = agg_sur_metrics.get(mk, 0.0) + mv * w_ratio
 
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     stealth_loss, stealth_metrics = loss_fn.compute_perceptual_stealth(x_clean, x_obf, delta)
                     scaled_stealth = stealth_loss / grad_accum
 
-                # Propagate accumulated surrogate gradients + stealth loss through EOT and generator
                 assert x_obf_aug_leaf.grad is not None
                 surrogate_grad_bridge = (x_obf_aug.float() * x_obf_aug_leaf.grad.detach().float()).sum()
                 (surrogate_grad_bridge + scaler.scale(scaled_stealth).float()).backward()
 
                 metrics = {
-                    "patch_cos_sim": agg_patch_cos,
-                    "global_cos_sim": agg_glob_cos,
-                    "surrogate_loss": agg_sur_loss,
+                    **agg_sur_metrics,
                     **stealth_metrics,
-                    "total_loss": agg_sur_loss + stealth_metrics["stealth_loss"],
+                    "total_loss": agg_sur_metrics.get("surrogate_loss", 0.0) + stealth_metrics["stealth_loss"],
                 }
             else:
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -333,9 +403,26 @@ def train(
             step_count += 1
             pbar.set_postfix(
                 patch_cos=f"{metrics['patch_cos_sim']:.3f}",
+                salient=f"{metrics.get('salient_patch_cos', metrics['patch_cos_sim']):.3f}",
                 glob_cos=f"{metrics['global_cos_sim']:.3f}",
-                loss=f"{metrics['total_loss']:.3f}",
+                conc70=f"{metrics.get('concealed_patches_70_pct', 0.0):.0f}%",
             )
+
+            if (idx + 1) % log_every == 0 or (idx + 1) == len(train_loader):
+                done_total = (epoch - 1) * len(train_loader) + (idx + 1)
+                all_total = epochs * len(train_loader)
+                elapsed_all = time.perf_counter() - train_start_time
+                eta_sec = (elapsed_all / max(done_total, 1)) * max(0, all_total - done_total)
+                eta_m, eta_s = int(eta_sec // 60), int(eta_sec % 60)
+                print(
+                    f"  [Live Step {idx + 1:03d}/{len(train_loader):03d} | Ep {epoch}/{epochs} | ETA {eta_m}m{eta_s:02d}s] "
+                    f"PatchCos={metrics['patch_cos_sim']:.3f} | "
+                    f"SalientCos={metrics.get('salient_patch_cos', 0.0):.3f} | "
+                    f"GlobalCos={metrics['global_cos_sim']:.3f} | "
+                    f"ConcealedPatches(<0.7)={metrics.get('concealed_patches_70_pct', 0.0):.1f}% | "
+                    f"ChromaRMS={metrics.get('chroma_rms_255', 0.0):.2f}/255",
+                    flush=True,
+                )
 
         train_summary = {k: v / max(1, step_count) for k, v in epoch_metrics.items()}
         val_sample_path = out_dir / "samples" / f"epoch_{epoch:03d}.png"
@@ -349,6 +436,9 @@ def train(
         )
         last_val_metrics = val_summary
         elapsed = time.perf_counter() - t0
+        total_elapsed = time.perf_counter() - train_start_time
+        rem_sec = (total_elapsed / epoch) * (epochs - epoch)
+        rem_m, rem_s = int(rem_sec // 60), int(rem_sec % 60)
 
         record = {
             "epoch": epoch,
@@ -361,12 +451,27 @@ def train(
             json.dump(history, f, indent=2)
 
         print(
-            f"[Epoch {epoch:03d}/{epochs:03d}] ({elapsed:.1f}s) "
-            f"Val Patch Cos: {val_summary['patch_cos_sim']:.4f} | "
-            f"Val Global Cos: {val_summary['global_cos_sim']:.4f} | "
-            f"PSNR: {val_summary['psnr_db']:.2f} dB | "
-            f"L_inf: {val_summary['linf_255']:.2f}/255"
+            f"\n+---------------------------------------------------------------------------------------+\n"
+            f"| EPOCH {epoch:02d}/{epochs:02d} ANALYTICS REPORT ({elapsed:.1f}s | Remaining ETA: {rem_m}m{rem_s:02d}s)\n"
+            f"+---------------------------------------------------------------------------------------+\n"
+            f"| Feature Disruption : Patch Cos = {val_summary['patch_cos_sim']:.4f} | Salient Foreground Cos = {val_summary.get('salient_patch_cos', 0.0):.4f} | Global Cos = {val_summary['global_cos_sim']:.4f}\n"
+            f"| Identification Stat: Feature ID Evasion = {val_summary.get('feature_reid_evasion_pct', 0.0):5.1f}% | Semantic Category Flip = {val_summary.get('semantic_neighbor_flip_pct', 0.0):5.1f}%\n"
+            f"| Spatial Masking    : Patches <0.70 Sim  = {val_summary.get('concealed_patches_70_pct', 0.0):5.1f}% | Patches <0.50 Sim      = {val_summary.get('concealed_patches_50_pct', 0.0):5.1f}%\n"
+            f"| Visual Stealth     : PSNR = {val_summary['psnr_db']:.2f} dB | Chroma Shift = {val_summary.get('chroma_rms_255', 0.0):.2f}/255 | L_inf = {val_summary['linf_255']:.2f}/255 | UAP Ratio = {val_summary.get('uap_collapse_ratio', 0.0):.3f}\n"
+            f"| Per-Transformer Breakdown:",
+            flush=True,
         )
+        for s_name in model_short_names:
+            p_c = val_summary.get(f"patch_cos/{s_name}", 0.0)
+            s_c = val_summary.get(f"salient_cos/{s_name}", 0.0)
+            g_c = val_summary.get(f"global_cos/{s_name}", 0.0)
+            ev_p = val_summary.get(f"reid_evasion_pct/{s_name}", 0.0)
+            fl_p = val_summary.get(f"semantic_flip_pct/{s_name}", 0.0)
+            print(
+                f"|   * {s_name:28s} -> PatchCos: {p_c:.4f} | SalientCos: {s_c:.4f} | GlobalCos: {g_c:.4f} | ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
+                flush=True,
+            )
+        print("+---------------------------------------------------------------------------------------+\n", flush=True)
 
         # Save latest & best checkpoints
         save_checkpoint(out_dir / "latest_generator.pt", generator, ema, config, epoch, val_summary)
