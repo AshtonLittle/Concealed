@@ -163,6 +163,7 @@ def train(
     output_dir: str | Path,
     device_str: Optional[str] = None,
     pretrained_surrogates: bool = True,
+    on_epoch_end: Optional[ object ] = None,
 ) -> Tuple[AmortizedObfuscationGenerator, Dict[str, float]]:
     """Execute end-to-end training of the Amortized Obfuscation Generator."""
     train_cfg = config.get("training", {})
@@ -185,6 +186,9 @@ def train(
     batch_size = int(train_cfg.get("batch_size", 4))
     val_split = float(train_cfg.get("val_split", 0.1))
     num_workers = int(train_cfg.get("num_workers", 0 if device.type == "cpu" else 4))
+    max_images = train_cfg.get("max_images", None)
+    if max_images is not None:
+        max_images = int(max_images)
 
     train_loader, val_loader = create_train_val_dataloaders(
         data_dir=data_dir,
@@ -193,6 +197,7 @@ def train(
         val_split=val_split,
         num_workers=num_workers,
         seed=seed,
+        max_images=max_images,
     )
 
     generator = build_generator(config).to(device)
@@ -371,6 +376,9 @@ def train(
 
         if epoch % save_every == 0:
             save_checkpoint(out_dir / f"generator_epoch_{epoch:03d}.pt", generator, ema, config, epoch, val_summary)
+
+        if callable(on_epoch_end):
+            on_epoch_end(epoch, out_dir, val_summary)
 
     # Automatically export the best generator to ONNX for immediate real-time pipeline use
     if train_cfg.get("auto_export_onnx", True):

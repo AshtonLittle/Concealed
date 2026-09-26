@@ -114,6 +114,7 @@ def create_train_val_dataloaders(
     val_split: float = 0.1,
     num_workers: int = 4,
     seed: int = 42,
+    max_images: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """Discover images in ``data_dir``, split into train/val sets, and return DataLoaders."""
     all_files = discover_images(data_dir)
@@ -123,6 +124,9 @@ def create_train_val_dataloaders(
     rng = random.Random(seed)
     shuffled = list(all_files)
     rng.shuffle(shuffled)
+
+    if max_images is not None and max_images > 0 and len(shuffled) > max_images:
+        shuffled = shuffled[:max_images]
 
     if len(shuffled) == 1:
         train_files = shuffled

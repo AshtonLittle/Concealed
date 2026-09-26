@@ -152,6 +152,25 @@ def main() -> None:
         help="Check status and live logs of the latest (or specified) Snowflake GPU training job",
     )
     parser.add_argument(
+        "--cancel",
+        nargs="?",
+        const="ALL",
+        default=None,
+        metavar="JOB_ID",
+        help="Cancel all currently running Snowflake GPU jobs (or a specific JOB_ID)",
+    )
+    parser.add_argument(
+        "--poc",
+        action="store_true",
+        help="Fast Proof-of-Concept mode (~2-3 minutes on GPU: 1,000 images, 5 epochs, batch_size=12, canonical_residual)",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Subsample at most N images from --data-dir for faster training",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="trained_model",
@@ -224,6 +243,33 @@ def main() -> None:
                 "(or save them in a .env file in this folder) and re-run."
             ) from exc
 
+    def _cancel_running_jobs(specific_id: str | None = None) -> None:
+        from snowflake.ml.jobs import get_job, list_jobs
+
+        session.sql("USE DATABASE CONCEALED_DB").collect()
+        session.sql("USE SCHEMA PUBLIC").collect()
+        if specific_id and specific_id != "ALL":
+            j = get_job(specific_id, session=session)
+            print(f"Canceling job {j.id} (current status: {j.status})...")
+            j.cancel()
+            return
+        df = list_jobs(session=session)
+        for _, row in df.iterrows():
+            st = str(row.get("status", "")).upper()
+            if st in {"RUNNING", "PENDING", "STARTING", "QUEUED"}:
+                jid = f"CONCEALED_DB.PUBLIC.{row['name']}"
+                try:
+                    j = get_job(jid, session=session)
+                    print(f"  -> Canceling active GPU job {jid} ({st}) to free compute pool...")
+                    j.cancel()
+                except Exception:
+                    pass
+
+    if args.cancel is not None:
+        _cancel_running_jobs(args.cancel)
+        print("Done canceling jobs.")
+        return
+
     if args.status is not None:
         from snowflake.ml.jobs import get_job, list_jobs
 
@@ -244,11 +290,14 @@ def main() -> None:
         return
 
     if not args.data_dir:
-        parser.error("--data-dir is required when launching a training job (or pass --status to check a running job).")
+        parser.error("--data-dir is required when launching a training job (or pass --status / --cancel).")
 
     print("[1/4] Provisioning Snowflake Database, Stages, and GPU Compute Pool...")
     for stmt in CORE_SQL_STATEMENTS:
         session.sql(stmt.format(instance_family=args.gpu_family)).collect()
+
+    # Automatically cancel any previously running job on CONCEALED_GPU_POOL so the node is free
+    _cancel_running_jobs("ALL")
 
     has_external_access = True
     try:
@@ -277,6 +326,22 @@ def main() -> None:
                 config["surrogates"]["cpu_offload"] = prof["cpu_offload"]
         if args.profile == "ocr":
             config.setdefault("generator", {})["hybrid_global_weight"] = 0.35
+
+    if args.poc:
+        print("  -> Fast Proof-of-Concept (--poc) enabled: 1,000 images, 5 epochs, batch_size=12, canonical_residual (256x256)")
+        config.setdefault("generator", {})["mode"] = "canonical_residual"
+        config.setdefault("generator", {})["canonical_size"] = 256
+        config.setdefault("surrogates", {})["sequential_grad_accum"] = False
+        config.setdefault("training", {})["train_resolution"] = 256
+        config.setdefault("training", {})["batch_size"] = 12
+        config.setdefault("training", {})["grad_accumulation_steps"] = 1
+        config.setdefault("training", {})["epochs"] = 5
+        config.setdefault("training", {})["warmup_epochs"] = 1
+        config.setdefault("training", {})["lr"] = 5.0e-4
+        config.setdefault("training", {})["max_images"] = 1000
+
+    if args.max_images is not None:
+        config.setdefault("training", {})["max_images"] = args.max_images
     if args.epochs is not None:
         config.setdefault("training", {})["epochs"] = args.epochs
     if args.surrogates is not None:
@@ -355,12 +420,22 @@ def main() -> None:
         else:
             sp_session.file.get("@CONCEALED_DB.PUBLIC.IMAGE_STAGE", str(local_imgs))
 
-        _, metrics = train(config=cfg, data_dir=local_imgs, output_dir=local_out, device_str="cuda")
+        def _sync_epoch_artifacts(_ep: int, out_dir_path: Path, _val_metrics: dict) -> None:
+            for pt_file in ("best_generator.pt", "latest_generator.pt"):
+                p = out_dir_path / pt_file
+                if p.exists():
+                    sp_session.file.put(
+                        str(p), "@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest", auto_compress=False, overwrite=True
+                    )
 
-        for fpath in local_out.glob("*.pt"):
-            sp_session.file.put(
-                str(fpath), "@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest", auto_compress=False, overwrite=True
-            )
+        _, metrics = train(
+            config=cfg,
+            data_dir=local_imgs,
+            output_dir=local_out,
+            device_str="cuda",
+            on_epoch_end=_sync_epoch_artifacts,
+        )
+
         for fpath in (local_out / "samples").glob("*.png"):
             sp_session.file.put(
                 str(fpath), "@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/samples", auto_compress=False, overwrite=True
