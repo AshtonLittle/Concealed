@@ -318,6 +318,19 @@ def train(
         if epoch % save_every == 0:
             save_checkpoint(out_dir / f"generator_epoch_{epoch:03d}.pt", generator, ema, config, epoch, val_summary)
 
+    # Automatically export the best generator to ONNX for immediate real-time pipeline use
+    if train_cfg.get("auto_export_onnx", True):
+        from concealed.pipeline.export import export_to_onnx
+
+        onnx_path = out_dir / "generator.onnx"
+        export_info = export_to_onnx(
+            generator=ema.ema_model,
+            output_path=onnx_path,
+            verify=True,
+            quantize_int8=False,
+        )
+        print(f"Auto-exported real-time ONNX model -> {export_info['onnx_path']} ({export_info['size_mb']} MB)")
+
     return ema.ema_model, last_val_metrics
 
 
