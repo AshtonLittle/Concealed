@@ -142,7 +142,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="One-command CLI to train Concealed on Snowflake GPU and download the trained ONNX model"
     )
-    parser.add_argument("--data-dir", type=str, required=True, help="Local directory of training images")
+    parser.add_argument("--data-dir", type=str, default=None, help="Local directory of training images")
+    parser.add_argument(
+        "--status",
+        nargs="?",
+        const="LATEST",
+        default=None,
+        metavar="JOB_ID",
+        help="Check status and live logs of the latest (or specified) Snowflake GPU training job",
+    )
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -199,6 +207,28 @@ def main() -> None:
         session = Session.builder.configs(conn_params).create()
     else:
         session = Session.builder.config("connection_name", args.connection_name).create()
+
+    if args.status is not None:
+        from snowflake.ml.jobs import get_job, list_jobs
+
+        session.sql("USE DATABASE CONCEALED_DB").collect()
+        session.sql("USE SCHEMA PUBLIC").collect()
+        target_id = args.status
+        if target_id == "LATEST":
+            df = list_jobs(session=session)
+            if len(df) == 0:
+                print("No Snowflake ML jobs found in CONCEALED_DB.PUBLIC.")
+                return
+            target_id = f"CONCEALED_DB.PUBLIC.{df.iloc[0]['name']}"
+        job = get_job(target_id, session=session)
+        print(f"Job ID : {job.id}")
+        print(f"Status : {job.status}")
+        print("\n--- Latest Container Logs ---")
+        job.show_logs()
+        return
+
+    if not args.data_dir:
+        parser.error("--data-dir is required when launching a training job (or pass --status to check a running job).")
 
     print("[1/4] Provisioning Snowflake Database, Stages, and GPU Compute Pool...")
     for stmt in CORE_SQL_STATEMENTS:
