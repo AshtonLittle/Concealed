@@ -15,3 +15,5 @@ trained_model/
 *.onnx
 *.pt
 *.tar
+WIN_*.jpg
+WIN_*.png
