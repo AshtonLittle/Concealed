@@ -195,6 +195,15 @@ def main() -> None:
             "Install them once via: pip install snowflake-snowpark-python snowflake-ml-python"
         ) from exc
 
+    # Auto-load .env file if present so new terminal tabs pick up credentials automatically
+    env_file = Path(".env")
+    if env_file.exists():
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
     # 1. Connect to Snowflake via environment variables or ~/.snowflake/connections.toml
     if os.environ.get("SNOWFLAKE_ACCOUNT") and os.environ.get("SNOWFLAKE_USER"):
         conn_params = {
@@ -206,7 +215,14 @@ def main() -> None:
         }
         session = Session.builder.configs(conn_params).create()
     else:
-        session = Session.builder.config("connection_name", args.connection_name).create()
+        try:
+            session = Session.builder.config("connection_name", args.connection_name).create()
+        except Exception as exc:
+            raise SystemExit(
+                "Snowflake credentials not found in this terminal window.\n"
+                "Set $env:SNOWFLAKE_ACCOUNT, $env:SNOWFLAKE_USER, and $env:SNOWFLAKE_PASSWORD "
+                "(or save them in a .env file in this folder) and re-run."
+            ) from exc
 
     if args.status is not None:
         from snowflake.ml.jobs import get_job, list_jobs

@@ -11,6 +11,7 @@ runs/
 checkpoints/
 trained_model/
 .snowflake_hf_cache/
+.env
 *.onnx
 *.pt
 *.tar
