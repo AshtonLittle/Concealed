@@ -10,7 +10,7 @@ generator:
   # - "native": Predicts delta directly at native input resolution
   # - "hybrid": Blends global canonical delta + local high-res tile deltas (defeats both global & tile-slicing VLMs)
   mode: "hybrid"
-  canonical_size: 384
+  canonical_size: 256
   tile_size: 384
   hybrid_global_weight: 0.6
   # Concentrates perturbation budget into high-frequency textured regions (Weber's Law masking)
@@ -114,8 +114,8 @@ loss:
   lpips_weight: 0.5
 
 training:
-  train_resolution: 512
-  batch_size: 6
+  train_resolution: 384
+  batch_size: 4
   grad_accumulation_steps: 2
   epochs: 40
   lr: 2.0e-4

@@ -131,17 +131,18 @@ def validate(
     generator.eval()
     accum: Dict[str, float] = {}
     count = 0
+    use_amp = device.type == "cuda"
 
     for batch_idx, x_clean in enumerate(val_loader):
         x_clean = x_clean.to(device, non_blocking=True)
-        x_obf, delta = generator(x_clean, return_delta=True)
-
-        clean_outputs = surrogates(x_clean)
-        obf_outputs = surrogates(x_obf)
-        _, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            x_obf, delta = generator(x_clean, return_delta=True)
+            clean_outputs = surrogates(x_clean)
+            obf_outputs = surrogates(x_obf)
+            _, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
 
         # Compute PSNR in dB
-        mse = torch.mean((x_clean - x_obf) ** 2).item()
+        mse = torch.mean((x_clean.float() - x_obf.float()) ** 2).item()
         psnr = 10.0 * math.log10(1.0 / max(mse, 1e-10))
         metrics["psnr_db"] = psnr
         metrics["linf_255"] = float(torch.max(torch.abs(delta)).item() * 255.0)
@@ -151,7 +152,7 @@ def validate(
         count += 1
 
         if batch_idx == 0 and sample_out_path is not None:
-            save_visual_comparison(x_clean, x_obf, delta, sample_out_path)
+            save_visual_comparison(x_clean.float(), x_obf.float(), delta.float(), sample_out_path)
 
     return {k: v / max(count, 1) for k, v in accum.items()}
 
@@ -180,8 +181,8 @@ def train(
     with open(out_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
 
-    resolution = int(train_cfg.get("train_resolution", 512))
-    batch_size = int(train_cfg.get("batch_size", 8))
+    resolution = int(train_cfg.get("train_resolution", 384))
+    batch_size = int(train_cfg.get("batch_size", 4))
     val_split = float(train_cfg.get("val_split", 0.1))
     num_workers = int(train_cfg.get("num_workers", 0 if device.type == "cpu" else 4))
 
@@ -252,14 +253,13 @@ def train(
             if (seq_grad_accum or cpu_offload) and len(surrogates.surrogates) > 1:
                 # In-VRAM Sequential Surrogate Backward:
                 # Keeps all surrogate weights on GPU (unless cpu_offload=True), but evaluates and
-                # backpropagates one surrogate at a time into `x_obf_leaf` so intermediate activation
-                # graphs are freed immediately after each model (5x lower activation VRAM, 0% accuracy loss).
+                # backpropagates one surrogate at a time into `x_obf_aug_leaf` so intermediate activation
+                # graphs are 100% freed immediately after each model without needing retain_graph=True.
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                     x_obf, delta = generator(x_clean, return_delta=True)
+                    x_clean_aug, x_obf_aug = eot(x_clean, x_obf)
 
-                x_obf_leaf = x_obf.detach().requires_grad_(True)
-                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    x_clean_aug, x_obf_aug = eot(x_clean, x_obf_leaf)
+                x_obf_aug_leaf = x_obf_aug.detach().requires_grad_(True)
 
                 total_w = sum(s.weight for s in surrogates.surrogates) or 1.0
                 agg_patch_cos = 0.0
@@ -272,10 +272,10 @@ def train(
                     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                         with torch.no_grad():
                             c_out = s_mod(x_clean_aug)
-                        o_out = s_mod(x_obf_aug)
+                        o_out = s_mod(x_obf_aug_leaf)
                         s_loss, s_metrics = loss_fn.compute_surrogate_disruption([c_out], [o_out])
                         weighted_s_loss = s_loss * (s_mod.weight / total_w) / grad_accum
-                    scaler.scale(weighted_s_loss).backward(retain_graph=True)
+                    scaler.scale(weighted_s_loss).backward()
                     if cpu_offload and device.type == "cuda":
                         s_mod.to("cpu")
 
@@ -288,10 +288,10 @@ def train(
                     stealth_loss, stealth_metrics = loss_fn.compute_perceptual_stealth(x_clean, x_obf, delta)
                     scaled_stealth = stealth_loss / grad_accum
 
-                # Propagate accumulated surrogate gradients + stealth loss through the generator
-                assert x_obf_leaf.grad is not None
-                surrogate_grad_bridge = (x_obf * x_obf_leaf.grad.detach()).sum()
-                (surrogate_grad_bridge + scaler.scale(scaled_stealth)).backward()
+                # Propagate accumulated surrogate gradients + stealth loss through EOT and generator
+                assert x_obf_aug_leaf.grad is not None
+                surrogate_grad_bridge = (x_obf_aug.float() * x_obf_aug_leaf.grad.detach().float()).sum()
+                (surrogate_grad_bridge + scaler.scale(scaled_stealth).float()).backward()
 
                 metrics = {
                     "patch_cos_sim": agg_patch_cos,

@@ -161,21 +161,26 @@ class BottleneckSelfAttention(nn.Module):
             num_groups -= 1
 
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.kv_proj = nn.Conv2d(channels, channels * 2, kernel_size=1, bias=False)
         self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.gamma = nn.Parameter(torch.full((1, channels, 1, 1), 0.2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         normed = self.norm(x)
-        qkv = self.qkv(normed).reshape(b, 3, self.num_heads, self.head_dim, h * w)
-        q = qkv[:, 0].transpose(-2, -1)  # [B, heads, HW, head_dim]
-        k = qkv[:, 1]                    # [B, heads, head_dim, HW]
-        v = qkv[:, 2].transpose(-2, -1)  # [B, heads, HW, head_dim]
+        q = self.q_proj(normed).reshape(b, self.num_heads, self.head_dim, h * w).transpose(-2, -1)  # [B, heads, HW, D]
+
+        # Spatial-Reduction Attention: pool K, V to a fixed 16x16 (256-token) context grid
+        # so attention complexity is O(HW * 256) instead of O((HW)^2), preventing VRAM spikes at high res.
+        kv_spatial = F.interpolate(normed, size=(16, 16), mode="bilinear", align_corners=False)
+        kv = self.kv_proj(kv_spatial).reshape(b, 2, self.num_heads, self.head_dim, 256)
+        k = kv[:, 0]                    # [B, heads, D, 256]
+        v = kv[:, 1].transpose(-2, -1)  # [B, heads, 256, D]
 
         attn = torch.matmul(q, k) * self.scale
         attn = torch.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)  # [B, heads, HW, head_dim]
+        out = torch.matmul(attn, v)  # [B, heads, HW, D]
         out = out.transpose(-2, -1).reshape(b, c, h, w)
         return x + self.gamma * self.proj(out)
 
@@ -386,8 +391,8 @@ class AmortizedObfuscationGenerator(nn.Module):
             raw_global = self._forward_backbone(x_canon)
             raw_global = F.interpolate(raw_global, size=(h, w), mode="bilinear", align_corners=False)
 
-            # 2. High-res 2x2 tile grid pass (defeats high-res tile-slicing VLMs like GPT-4o / Qwen2-VL)
-            local_s = max(16, ((self.tile_size * 2) // 8) * 8)
+            # 2. High-res tile grid pass (defeats high-res tile-slicing VLMs like GPT-4o / Qwen2-VL)
+            local_s = max(16, (self.tile_size // 8) * 8)
             x_local = F.interpolate(x, size=(local_s, local_s), mode="bilinear", align_corners=False)
             raw_local = self._forward_backbone(x_local)
             raw_local = F.interpolate(raw_local, size=(h, w), mode="bilinear", align_corners=False)

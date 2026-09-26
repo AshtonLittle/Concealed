@@ -261,6 +261,7 @@ def main() -> None:
     remote_kwargs = {
         "stage_name": "MODEL_STAGE",
         "imports": job_imports,
+        "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         "session": session,
     }
     if has_external_access:
