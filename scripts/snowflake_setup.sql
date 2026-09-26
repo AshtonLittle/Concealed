@@ -31,14 +31,7 @@ CREATE COMPUTE POOL IF NOT EXISTS CONCEALED_GPU_POOL
 CREATE OR REPLACE NETWORK RULE HF_PYPI_NETWORK_RULE
   MODE = EGRESS
   TYPE = HOST_PORT
-  VALUE_LIST = (
-    'huggingface.co:443',
-    'cdn-lfs.huggingface.co:443',
-    'cdn-lfs-us-1.huggingface.co:443',
-    'cas-bridge.xethub.hf.co:443',
-    'pypi.org:443',
-    'files.pythonhosted.org:443'
-  );
+  VALUE_LIST = ('0.0.0.0:443', '0.0.0.0:80');
 
 CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION CONCEALED_HF_ACCESS
   ALLOWED_NETWORK_RULES = (HF_PYPI_NETWORK_RULE)

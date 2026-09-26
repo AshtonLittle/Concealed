@@ -16,8 +16,13 @@ from torchvision.transforms import functional as TF
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
 
-def discover_images(root_dir: str | Path) -> List[Path]:
-    """Recursively discover all supported image files in ``root_dir``."""
+def discover_images(root_dir: str | Path, deduplicate: bool = True) -> List[Path]:
+    """Recursively discover all supported image files in ``root_dir``.
+
+    When ``deduplicate=True`` (default), skips duplicate copies of the same filename
+    and byte size in subdirectories (e.g., when a dataset folder contains both flat images
+    and a ``by_category/`` subfolder copy).
+    """
     root = Path(root_dir)
     if not root.exists():
         raise FileNotFoundError(f"Image directory does not exist: {root}")
@@ -25,12 +30,22 @@ def discover_images(root_dir: str | Path) -> List[Path]:
         return [root]
 
     files: List[Path] = []
-    for dirpath, _, filenames in os.walk(root):
-        for fname in filenames:
+    seen_keys: set[tuple[str, int]] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for fname in sorted(filenames):
             ext = os.path.splitext(fname)[1].lower()
             if ext in SUPPORTED_EXTENSIONS:
-                files.append(Path(dirpath) / fname)
-    files.sort()
+                full_path = Path(dirpath) / fname
+                if deduplicate:
+                    try:
+                        key = (fname.lower(), full_path.stat().st_size)
+                    except OSError:
+                        key = (fname.lower(), -1)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                files.append(full_path)
     return files
 
 
