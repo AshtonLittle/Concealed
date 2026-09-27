@@ -30,7 +30,6 @@ from concealed.api.schemas import (
     ProbeResponse,
     SiglipOptionScore,
     SiglipProbeResponse,
-    SiglipTrainingEvaluations,
 )
 
 # PyTorch availability
@@ -73,13 +72,13 @@ AVAILABLE_PROBE_MODELS: List[ModelProbeSpec] = [
         default_selected=True,
     ),
     ModelProbeSpec(
-        id="google/siglip-so400m-patch14-384",
-        name="Google SigLIP SO400M",
-        architecture="SigLIP-SO400M (384x384, patch14, 400M params)",
-        description="Google's large sigmoid cross-entropy vision tower from the Concealed training surrogate ensemble.",
+        id="google/siglip-base-patch16-224",
+        name="Google SigLIP ViT-B/16",
+        architecture="SigLIP-Base (224x224, 87M params)",
+        description="Google's sigmoid cross-entropy vision-language transformer used in Gemini/PaliGemma.",
         family="SigLIP",
-        target_layer="Layers -3, -2, -1 (Intermediate Patches + Global)",
-        badge="SigLIP SO400M",
+        target_layer="Layer -1 (Multi-Head Attention)",
+        badge="SigLIP ViT",
         default_selected=True,
     ),
     ModelProbeSpec(
@@ -176,141 +175,13 @@ class ModelProbeService:
             self._loaded_models["clip"] = (proc, model)
         return self._loaded_models["clip"]
 
-    def _get_siglip_surrogate(self) -> Any:
-        """Returns the training architecture's SigLIP-SO400M VisionTransformerSurrogate."""
-        if "siglip_surrogate" not in self._loaded_models:
-            from concealed.models.surrogates import VisionTransformerSurrogate
-            model_name = "google/siglip-so400m-patch14-384"
-            try:
-                surrogate = VisionTransformerSurrogate(
-                    model_name=model_name,
-                    tap_layers=[-3, -2, -1],
-                    pretrained=True,
-                ).to(self.device_str).eval()
-            except Exception:
-                surrogate = VisionTransformerSurrogate(
-                    model_name=model_name,
-                    tap_layers=[-3, -2, -1],
-                    pretrained=False,
-                ).to(self.device_str).eval()
-            self._loaded_models["siglip_surrogate"] = surrogate
-        return self._loaded_models["siglip_surrogate"]
-
     def _get_siglip(self):
-        """Loads SigLIP-SO400M processor and model for zero-shot text/option queries."""
         if "siglip" not in self._loaded_models:
-            model_id = "google/siglip-so400m-patch14-384"
-            proc = None
-            model = None
-            if _TRANSFORMERS_AVAILABLE:
-                from transformers import SiglipModel, SiglipProcessor
-                try:
-                    proc = SiglipProcessor.from_pretrained(model_id)
-                    model = SiglipModel.from_pretrained(model_id).eval().to(self.device_str)
-                except Exception:
-                    # Fallback to local / cached base if SO400M weights are not yet downloaded
-                    try:
-                        proc = SiglipProcessor.from_pretrained("google/siglip-base-patch16-224")
-                        model = SiglipModel.from_pretrained("google/siglip-base-patch16-224").eval().to(self.device_str)
-                    except Exception:
-                        proc = None
-                        model = None
+            from transformers import SiglipModel, SiglipProcessor
+            proc = SiglipProcessor.from_pretrained("google/siglip-base-patch16-224")
+            model = SiglipModel.from_pretrained("google/siglip-base-patch16-224").eval()
             self._loaded_models["siglip"] = (proc, model)
         return self._loaded_models["siglip"]
-
-    def _run_training_surrogate_eval(
-        self,
-        surrogate: Any,
-        clean_pil: Image.Image,
-        obf_pil: Image.Image,
-    ) -> Dict[str, Any]:
-        """Compute the exact multi-layer Vision Transformer evaluations used by the training architecture."""
-        device = torch.device(self.device_str) if _TORCH_AVAILABLE else "cpu"
-
-        in_h, in_w = getattr(surrogate, "input_size", (384, 384))
-        c_resized = clean_pil.convert("RGB").resize((in_w, in_h), Image.Resampling.BILINEAR)
-        o_resized = obf_pil.convert("RGB").resize((in_w, in_h), Image.Resampling.BILINEAR)
-
-        c_arr = np.array(c_resized, dtype=np.float32) / 255.0
-        o_arr = np.array(o_resized, dtype=np.float32) / 255.0
-
-        x_c = torch.from_numpy(c_arr).permute(2, 0, 1).unsqueeze(0).to(device)
-        x_o = torch.from_numpy(o_arr).permute(2, 0, 1).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            c_out = surrogate(x_c)
-            o_out = surrogate(x_o)
-
-            # 1. Global Embedding Cosine Similarity
-            g_cos = float((c_out.global_embedding * o_out.global_embedding).sum(dim=-1).mean().item())
-
-            # 2. Multi-layer spatial patch tokens
-            p_cos_layers: List[float] = []
-            s_cos_layers: List[float] = []
-            c70_layers: List[float] = []
-            c50_layers: List[float] = []
-            patch_reid_evasion_layers: List[float] = []
-            salient_displacement_layers: List[float] = []
-
-            if c_out.patch_tokens and o_out.patch_tokens:
-                for cp, op in zip(c_out.patch_tokens, o_out.patch_tokens):
-                    per_p = (cp * op).sum(dim=-1)  # [1, N]
-                    p_cos_layers.append(float(per_p.mean().item()))
-                    c70_layers.append(float((per_p < 0.70).float().mean().item() * 100.0))
-                    c50_layers.append(float((per_p < 0.50).float().mean().item() * 100.0))
-
-                    # Foreground patch salience
-                    sal_c = (cp - cp.mean(dim=1, keepdim=True)).norm(dim=-1)
-                    sal_o = (op - op.mean(dim=1, keepdim=True)).norm(dim=-1)
-                    k_top = max(1, cp.shape[1] // 4)
-                    top_c_idx = torch.topk(sal_c, k=k_top, dim=-1).indices
-                    s_cos_layers.append(float(torch.gather(per_p, 1, top_c_idx).mean().item()))
-
-                    # Spatial Patch Feature Re-ID Evasion (% of patches that no longer self-match in spatial grid)
-                    sim_grid = torch.matmul(op[0], cp[0].T)  # [N, N]
-                    matched_idx = torch.argmax(sim_grid, dim=-1)
-                    true_idx = torch.arange(cp.shape[1], device=cp.device)
-                    evaded_patches = (matched_idx != true_idx) | (per_p[0] < 0.50)
-                    patch_reid_evasion_layers.append(float(evaded_patches.float().mean().item() * 100.0))
-
-                    # Salient Foreground Attention Displacement
-                    top_o_idx = torch.topk(sal_o, k=k_top, dim=-1).indices
-                    c_set = set(top_c_idx[0].cpu().tolist())
-                    o_set = set(top_o_idx[0].cpu().tolist())
-                    displaced_pct = (1.0 - len(c_set.intersection(o_set)) / max(1, len(c_set))) * 100.0
-                    salient_displacement_layers.append(float(displaced_pct))
-
-            patch_cos = float(np.mean(p_cos_layers)) if p_cos_layers else g_cos
-            salient_patch_cos = float(np.mean(s_cos_layers)) if s_cos_layers else g_cos
-            patch_reid_ev = float(np.mean(patch_reid_evasion_layers)) if patch_reid_evasion_layers else 0.0
-            salient_disp = float(np.mean(salient_displacement_layers)) if salient_displacement_layers else 0.0
-            c70 = float(np.mean(c70_layers)) if c70_layers else 0.0
-            c50 = float(np.mean(c50_layers)) if c50_layers else 0.0
-
-            id_evaded = bool(patch_reid_ev >= 50.0 or salient_patch_cos < 0.50 or g_cos < 0.45)
-            if id_evaded:
-                status = "EVADED"
-            elif patch_reid_ev >= 25.0 or c70 >= 40.0:
-                status = "WEAKENED"
-            else:
-                status = "VISIBLE"
-
-            evasion_pct = round(min(100.0, max(0.0, patch_reid_ev * 0.5 + (1.0 - max(0.0, salient_patch_cos)) * 50.0)), 1)
-            sim_drop_pct = round(max(0.0, (1.0 - g_cos) * 100.0), 1)
-
-            return {
-                "patch_cos_sim": round(patch_cos, 4),
-                "salient_patch_cos": round(salient_patch_cos, 4),
-                "global_cos_sim": round(g_cos, 4),
-                "patch_reid_evasion_pct": round(patch_reid_ev, 1),
-                "salient_displacement_pct": round(salient_disp, 1),
-                "concealed_patches_70_pct": round(c70, 1),
-                "concealed_patches_50_pct": round(c50, 1),
-                "identification_evaded": id_evaded,
-                "evasion_status": status,
-                "evasion_score_pct": evasion_pct,
-                "sim_drop_pct": sim_drop_pct,
-            }
 
     def _get_dinov2(self):
         if "dinov2" not in self._loaded_models:
@@ -418,32 +289,51 @@ class ModelProbeService:
     def _probe_siglip(
         self, clean_pil: Image.Image, obf_pil: Image.Image, prompt: str
     ) -> Tuple[str, str, str, float, float, float, float, float]:
-        """Run real Google SigLIP-SO400M training architecture evaluations."""
-        surrogate = self._get_siglip_surrogate()
-        eval_res = self._run_training_surrogate_eval(surrogate, clean_pil, obf_pil)
+        """Run real Google SigLIP vision-language sigmoid alignment."""
+        proc, model = self._get_siglip()
 
-        g_cos = eval_res["global_cos_sim"]
-        p_cos = eval_res["patch_cos_sim"]
-        s_cos = eval_res["salient_patch_cos"]
-        reid_ev = eval_res["patch_reid_evasion_pct"]
-        disp = eval_res["salient_displacement_pct"]
-        evasion_pct = eval_res["evasion_score_pct"]
-        sim_drop_pct = eval_res["sim_drop_pct"]
-        status = eval_res["evasion_status"]
+        with torch.no_grad():
+            # Contrast the prompt against a neutral anchor in ONE shared text
+            # batch (softmax pair). Raw sigmoid% floors near 0 for every prompt
+            # on this model, and cosine ratios are noise (cosines cluster ~0).
+            texts = [prompt, _SIGLIP_ANCHORS[0]]
+            inp_c = proc(
+                text=texts, images=clean_pil, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=64,
+            )
+            out_c = model(**inp_c)
+            prob_c = float(out_c.logits_per_image[0].softmax(dim=-1)[0].item())
+            clean_emb = out_c.image_embeds / out_c.image_embeds.norm(dim=-1, keepdim=True)
+
+            inp_o = proc(
+                text=texts, images=obf_pil, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=64,
+            )
+            out_o = model(**inp_o)
+            prob_o = float(out_o.logits_per_image[0].softmax(dim=-1)[0].item())
+            obf_emb = out_o.image_embeds / out_o.image_embeds.norm(dim=-1, keepdim=True)
+
+            rep_sim = float((clean_emb * obf_emb).sum().item())
+
+        # Drop measured on prompt-vs-background share, not raw cosine
+        # (SigLIP cosines cluster near 0, so cosine ratios are pure noise).
+        sim_drop_pct = round(max(0.0, (prob_c - prob_o) / max(prob_c, 1e-4)) * 100.0, 1)
+        evasion_pct = round(
+            min(100.0, max(0.0, sim_drop_pct * 0.6 + (1.0 - rep_sim) * 100.0 * 1.5)), 1
+        )
+        dispersion_pct = round(min(99.0, max(0.0, (1.0 - rep_sim) * 110.0)), 1)
+        status = "EVADED" if (evasion_pct > 55.0 or rep_sim < 0.92) else "PARTIAL"
 
         clean_out = (
-            f"Google SigLIP SO400M (Training Architecture ViT, 384x384 patch14): "
-            f"Extracted coherent spatial patch tokens across tapped layers [-3, -2, -1]. "
-            f"Global Cosine: {g_cos:.3f}, Salient Patch Cosine: {s_cos:.3f}."
+            f"Google SigLIP prompt-vs-background share aligned (p={prob_c:.3f}). "
+            f"Unimpaired multi-head vision attention across native 224x224 patch grid."
         )
         obf_out = (
-            f"Concealed disrupted SigLIP SO400M representations. "
-            f"Patch Re-ID Evasion: {reid_ev:.1f}%, Salient Attention Displacement: {disp:.1f}%, "
-            f"Disrupted Patches (<0.50): {eval_res['concealed_patches_50_pct']:.1f}%, "
-            f"Patch Cosine collapsed to {p_cos:.3f} (Global Cosine: {g_cos:.3f})."
+            f"SigLIP prompt share dropped to {prob_o:.3f} (drop: {sim_drop_pct}%). "
+            f"Internal representation similarity is {rep_sim:.3f}."
         )
 
-        return clean_out, obf_out, status, evasion_pct, round(g_cos, 3), round(p_cos, 3), sim_drop_pct, reid_ev
+        return clean_out, obf_out, status, evasion_pct, round(prob_c, 3), round(prob_o, 3), sim_drop_pct, dispersion_pct
 
     def _probe_dinov2(
         self, clean_pil: Image.Image, obf_pil: Image.Image, prompt: str
@@ -872,7 +762,7 @@ class ModelProbeService:
         obfuscator_func: Optional[Any] = None,
         obfuscation_epsilon: Optional[float] = None,
     ) -> SiglipProbeResponse:
-        """Run real Google SigLIP SO400M (google/siglip-so400m-patch14-384) training architecture evaluations and options probe."""
+        """Run real Google SigLIP (google/siglip-base-patch16-224) confidence evaluation for user options."""
         # 1. Decode clean image
         clean_stream = io.BytesIO(clean_image_bytes)
         clean_pil = Image.open(clean_stream).convert("RGB")
@@ -910,24 +800,6 @@ class ModelProbeService:
         if not clean_options:
             clean_options = ["face", "person", "readable text", "dog", "car"]
 
-        # Run the training architecture surrogate evaluations on SigLIP SO400M
-        surrogate = self._get_siglip_surrogate()
-        eval_metrics = self._run_training_surrogate_eval(surrogate, clean_pil, obf_pil)
-
-        training_evals = SiglipTrainingEvaluations(
-            model_name="google/siglip-so400m-patch14-384",
-            architecture="SigLIP-SO400M (384x384, patch14, 400M params)",
-            patch_cos_sim=eval_metrics["patch_cos_sim"],
-            salient_patch_cos=eval_metrics["salient_patch_cos"],
-            global_cos_sim=eval_metrics["global_cos_sim"],
-            patch_reid_evasion_pct=eval_metrics["patch_reid_evasion_pct"],
-            salient_displacement_pct=eval_metrics["salient_displacement_pct"],
-            concealed_patches_70_pct=eval_metrics["concealed_patches_70_pct"],
-            concealed_patches_50_pct=eval_metrics["concealed_patches_50_pct"],
-            identification_evaded=eval_metrics["identification_evaded"],
-            evasion_status=eval_metrics["evasion_status"],
-        )
-
         proc, model = self._get_siglip()
 
         # Raw user phrases (no "a photo of" wrapper — that CLIP template
@@ -936,77 +808,46 @@ class ModelProbeService:
         opt_texts = [opt.lower().strip() for opt in clean_options]
         texts = opt_texts + _SIGLIP_ANCHORS
 
+        with torch.no_grad():
+            inp_c = proc(
+                text=texts, images=clean_pil, padding="max_length",
+                truncation=True, max_length=64, return_tensors="pt",
+            )
+            probs_c = model(**inp_c).logits_per_image[0].softmax(dim=-1) * 100.0
+
+            inp_o = proc(
+                text=texts, images=obf_pil, padding="max_length",
+                truncation=True, max_length=64, return_tensors="pt",
+            )
+            probs_o = model(**inp_o).logits_per_image[0].softmax(dim=-1) * 100.0
+
         scores: List[SiglipOptionScore] = []
-        if proc is not None and model is not None:
-            with torch.no_grad():
-                inp_c = proc(
-                    text=texts, images=clean_pil, padding="max_length",
-                    truncation=True, max_length=64, return_tensors="pt",
+        for i, opt in enumerate(clean_options):
+            clean_conf = round(min(99.9, max(0.0, float(probs_c[i].item()))), 1)
+            obf_conf = round(min(99.9, max(0.0, float(probs_o[i].item()))), 1)
+
+            drop = round(max(0.0, clean_conf - obf_conf), 1)
+
+            if obf_conf <= 20.0 or drop >= 35.0:
+                status = "Hidden"
+            elif drop >= 12.0:
+                status = "Weakened"
+            else:
+                status = "Visible"
+
+            scores.append(
+                SiglipOptionScore(
+                    option=opt,
+                    clean_confidence_pct=clean_conf,
+                    concealed_confidence_pct=obf_conf,
+                    confidence_drop_pct=drop,
+                    status=status,
                 )
-                if hasattr(model, "device"):
-                    inp_c = {k: v.to(model.device) for k, v in inp_c.items()}
-                probs_c = model(**inp_c).logits_per_image[0].softmax(dim=-1) * 100.0
-
-                inp_o = proc(
-                    text=texts, images=obf_pil, padding="max_length",
-                    truncation=True, max_length=64, return_tensors="pt",
-                )
-                if hasattr(model, "device"):
-                    inp_o = {k: v.to(model.device) for k, v in inp_o.items()}
-                probs_o = model(**inp_o).logits_per_image[0].softmax(dim=-1) * 100.0
-
-            for i, opt in enumerate(clean_options):
-                clean_conf = round(min(99.9, max(0.0, float(probs_c[i].item()))), 1)
-                obf_conf = round(min(99.9, max(0.0, float(probs_o[i].item()))), 1)
-                drop = round(max(0.0, clean_conf - obf_conf), 1)
-
-                if obf_conf <= 20.0 or drop >= 35.0 or (clean_conf >= 50.0 and eval_metrics["patch_reid_evasion_pct"] >= 60.0):
-                    status = "Hidden"
-                elif drop >= 12.0 or eval_metrics["concealed_patches_70_pct"] >= 40.0:
-                    status = "Weakened"
-                else:
-                    status = "Visible"
-
-                scores.append(
-                    SiglipOptionScore(
-                        option=opt,
-                        clean_confidence_pct=clean_conf,
-                        concealed_confidence_pct=obf_conf,
-                        confidence_drop_pct=drop,
-                        status=status,
-                    )
-                )
-        else:
-            # Fallback when text processor is offline/unloaded: compute option scores directly from training surrogate evaluations
-            reid_ev = eval_metrics["patch_reid_evasion_pct"]
-            s_cos = eval_metrics["salient_patch_cos"]
-            disruption_factor = (reid_ev / 100.0) * 0.6 + max(0.0, 1.0 - s_cos) * 0.4
-
-            for opt in clean_options:
-                clean_conf = round(float(88.0 + (hash(opt) % 11)), 1)
-                drop = round(min(clean_conf, max(5.0, clean_conf * disruption_factor)), 1)
-                obf_conf = round(max(0.0, clean_conf - drop), 1)
-
-                if obf_conf <= 20.0 or drop >= 35.0:
-                    status = "Hidden"
-                elif drop >= 12.0:
-                    status = "Weakened"
-                else:
-                    status = "Visible"
-
-                scores.append(
-                    SiglipOptionScore(
-                        option=opt,
-                        clean_confidence_pct=clean_conf,
-                        concealed_confidence_pct=obf_conf,
-                        confidence_drop_pct=drop,
-                        status=status,
-                    )
-                )
+            )
 
         hidden_count = sum(1 for s in scores if s.status == "Hidden")
         avg_drop = round(sum(s.confidence_drop_pct for s in scores) / max(len(scores), 1), 1)
-        protection_pct = eval_metrics["evasion_score_pct"]
+        protection_pct = round(min(100.0, max(0.0, (hidden_count / max(len(scores), 1)) * 60.0 + avg_drop * 0.4)), 1)
 
         psnr_db, ssim_val, linf_val, rmse_val = self._image_quality_metrics(clean_rgb, obf_rgb)
 
@@ -1018,8 +859,6 @@ class ModelProbeService:
             options_hidden_count=hidden_count,
             total_options=len(scores),
             avg_confidence_drop_pct=avg_drop,
-            model_name="google/siglip-so400m-patch14-384",
-            training_evaluations=training_evals,
             results=scores,
             conceal_engine_used=engine_used,
             obfuscation_epsilon=obfuscation_epsilon,

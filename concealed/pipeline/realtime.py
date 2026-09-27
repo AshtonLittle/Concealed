@@ -264,7 +264,7 @@ class RealtimeObfuscator:
             if isinstance(m, dict) and "name" in m
         ]
         names = surrogate_names or ckpt_models or [
-            "google/siglip-so400m-patch14-384",
+            "google/siglip-base-patch16-224",
             "openai/clip-vit-base-patch16",
             "facebook/dinov2-base",
             "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
@@ -412,7 +412,7 @@ class RealtimeObfuscator:
             pass
 
         model_list = eval_models or [
-            "google/siglip-so400m-patch14-384",
+            "google/siglip-base-patch16-224",
             "openai/clip-vit-base-patch16",
             "facebook/dinov2-base",
             "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
