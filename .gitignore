@@ -33,6 +33,8 @@ ENV/
 # Output images & camera test captures
 modified_*
 test_*
+!tests/
+!tests/*.py
 output_*
 WIN_*.jpg
 WIN_*.png
