@@ -1,8 +1,8 @@
 # Concealed
 
-**Amortized Adversarial Generator Network & Hybrid ViT Refinement Pipeline for Real-Time Image Obfuscation Against Vision Transformers.**
+**Amortized Adversarial Generator Network & Hybrid ViT Refinement Pipeline for Real-Time Image & Video Obfuscation Against Vision Transformers.**
 
-`Concealed` trains a compact, 100% ONNX-native neural network ($G_\theta$) that synthesizes visually imperceptible, $L_\infty$-bounded perturbations ($\delta = G_\theta(x)$, $\|\delta\|_\infty \le \epsilon$) to disrupt open-source and frontier Vision Transformer (ViT) representations (`SigLIP`, `CLIP`, `DINOv2`, `ConvNeXt`, `EVA-02`) without introducing visible color casts or skin-wrinkle distortions.
+`Concealed` trains a compact, 100% ONNX-native neural network ($G_\theta$) that synthesizes visually imperceptible, $L_\infty$-bounded perturbations ($\delta = G_\theta(x)$, $\|\delta\|_\infty \le \epsilon$) designed to disrupt open-source and frontier Vision Transformer (ViT) representations (`SigLIP`, `CLIP`, `DINOv2`, `ConvNeXt`, `EVA-02`) in real-time pipelines, with support for whole-image protection, video streams, and targeted silhouette-conforming feature obscuring without introducing visible color casts or skin-wrinkle distortions.
 
 ---
 
@@ -11,16 +11,22 @@
 1. **Two-Tier Inference (Zero-Shot Real-Time + Hybrid High-Pass ViT Refinement)**:
    - **Zero-Shot Amortized Pass (`<10ms` GPU / `<40ms` CPU)**: A ~1.8M parameter U-Net generator (`base` preset) predicts image-adaptive perturbations in a single forward pass and exports cleanly to **ONNX**, **INT8 ONNX**, and **TorchScript** for real-time video/webcam streams.
    - **Hybrid High-Pass ViT Refinement (`--refine-steps`)**: For static high-resolution photos (`720p`/`1080p`/`4K`), warm-starts from the generator's prediction and runs a fast, edge-locked multi-scale (`224x224` + `384x384`) Adam refinement loop with Total Variation (TV) smoothness and native-resolution skin protection (`PSNR > 46 dB`, `SSIM > 0.994`).
-2. **Wrinkle-Free Perceptual & Chrominance Stealth**:
+2. **Hybrid Global + High-Res Tile Synthesis (`hybrid` mode)**:
+   - **Global Canonical Residual Branch**: Synthesizes perturbations at a ViT-aligned canonical scale ($384\times 384$) and bilinearly upsamples only the residual $\delta$ to the native image resolution—preventing anti-aliased downsampling cancellation on $1080\text{p}/4\text{K}$ images while keeping original pixels 100% sharp.
+   - **High-Res $2\times 2$ Tile Grid Branch**: Simultaneously targets high-resolution local tile crops used by modern frontier VLMs (GPT-4o high-detail mode, Qwen2-VL, InternVL, LLaVA-NeXT).
+3. **Wrinkle-Free Perceptual & Chrominance Stealth**:
    - **Pre-Upsample Soft `tanh` + Bicubic Smoothing**: Bounds canonical perturbations *before* upsampling to native HD/4K resolution so zero-crossings never form sharp step-edge contour lines ("wrinkles") across faces.
    - **YCbCr Opponent Chrominance Damping**: Suppresses RGB opponent color channels ($\Delta C_b, \Delta C_r$) by 70–82% so perturbations operate almost purely along luminance edges (`Opponent Chroma Shift < 0.20/255` — zero purple/green tint).
    - **Scale-Invariant `WeberTextureMask`**: Concentrates perturbation budget onto high-frequency textures (hair, eyeglasses, fabric weave, brick mortar) while keeping flat backgrounds and smooth facial skin calm.
-3. **Multi-Account Snowflake SPCS GPU Fleet Orchestration (`concealed-snowflake`)**:
+4. **Multi-Account Snowflake SPCS GPU Fleet Orchestration (`concealed-snowflake`)**:
    - Automatically discovers all Snowflake accounts configured in a single `.env` file (`SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_ACCOUNT_2`, `SNOWFLAKE_ACCOUNT_3`, `SNOWFLAKE_ACCOUNT_4`, ...).
    - Splits the dataset into a **deterministic shared validation gallery** + **disjoint per-account training shards**, streams color-coded live telemetry from all GPU containers in parallel, and merges the resulting checkpoints via **Validation-Weighted Task-Vector Model Soup** (`--merge`).
-4. **Pluggable Surrogate Profiles (`fast`, `heavy`, `ocr`, or Single-Model Target)**:
-   - Out-of-the-box support for **Google SigLIP** (`google/siglip-*`), **OpenAI / Apple DFN / LAION CLIP** (`openai/clip-*`, `apple/DFN5B-*`, `laion/CLIP-convnext_*`), **Meta DINOv2** (`facebook/dinov2-*`), **GLM-OCR** (`zai-org/GLM-OCR`), and any **`timm` Vision Transformer**.
+5. **Pluggable Open-Source Surrogate Profiles & Ensembles**:
+   - Out-of-the-box support for **Google SigLIP** (`google/siglip-*`), **OpenAI / Apple DFN / LAION CLIP** (`openai/clip-*`, `apple/DFN5B-*`, `laion/CLIP-convnext_*`), **Meta DINOv2** (`facebook/dinov2-*`), **GLM-OCR** (`zai-org/GLM-OCR`), and any **`timm` Vision Transformer** (`timm/vit_*`, `timm/eva02_*`, `timm/swin_*`).
+   - Disrupts **both global `[CLS]`/pooled embeddings and multi-layer intermediate spatial patch tokens** (`tap_layers: [-4, -2, -1]`) wrapped in **Differentiable EOT** (`DiffJPEG` + DI-FGSM multi-scale resize + VLM tile cropping).
    - Sequential gradient accumulation (`sequential_grad_accum: true`) frees each surrogate's activation graph immediately after its backward pass so multi-model ensembles fit comfortably in 16 GB VRAM without CPU-offload slowdowns.
+6. **Feature-Targeted Silhouette Obfuscation**:
+   - Detects specific visual features (face, arms, text, tables, water bottles, laptops, and arbitrary objects) and applies protection strictly conforming to the object's silhouette.
 
 ---
 
@@ -100,6 +106,7 @@ flowchart TD
     Soup --> Out["trained_model/best_generator.pt\n+ trained_model/generator.onnx"]
 ```
 
+
 ---
 
 ## Installation
@@ -110,6 +117,8 @@ uv sync
 
 # Or standard pip
 pip install -e ".[dev,perceptual]"
+# Or via requirements:
+pip install -r requirements.txt
 ```
 
 ---
@@ -215,6 +224,41 @@ uv run concealed-export \
   --torchscript trained_model/generator.torchscript.pt
 ```
 
+### 5. Python Pipeline Usage
+
+```python
+from PIL import Image
+from concealed.pipeline.realtime import RealtimeObfuscator
+
+# Load either a PyTorch (.pt) checkpoint or an exported ONNX (.onnx) model
+obfuscator = RealtimeObfuscator("runs/exp1/generator.onnx", device="cuda")
+
+# 1. PIL Image (preserves exact native resolution)
+img = Image.open("photo.jpg")
+protected_img = obfuscator.obfuscate_pil(img)
+protected_img.save("photo_protected.jpg")
+
+# 2. OpenCV BGR Video Frame (for 30-60+ FPS streaming pipelines)
+# protected_frame = obfuscator.obfuscate_bgr_frame(frame_bgr)
+```
+
+### 6. Feature-Targeted Silhouette Obfuscation
+
+```bash
+# Modify faces conforming to head contour
+python image_processor.py my_photo.png --feature face
+
+# Modify arms conforming to limbs
+python image_processor.py my_photo.png --feature arms
+
+# Modify all text in the image
+python image_processor.py document.png --feature text
+
+# Modify custom objects
+python image_processor.py room.png --feature laptop
+python image_processor.py street.png --feature people
+```
+
 ---
 
 ## Repository Structure
@@ -236,3 +280,4 @@ concealed/
 ├── snowflake_cli.py          # Multi-account Snowflake SPCS GPU fleet provisioner, live streamer & Model Soup merger
 └── train.py                  # Training loop, Spatial Patch Re-ID validation, and Task-Vector Model Soup merge
 ```
+

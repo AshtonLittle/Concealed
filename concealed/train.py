@@ -208,7 +208,6 @@ def merge_generator_checkpoints(
             }
             torch.save(payload, out_p)
         return generator, merge_info
-
     merged_sd: Dict[str, torch.Tensor] = {}
     for k, ref_tensor in target_sd.items():
         if not ref_tensor.is_floating_point():
@@ -331,7 +330,6 @@ def validate(
                 spatial_patch_evasion_accum.setdefault(short_name, []).append(
                     float(evaded_patches.float().mean().item() * 100.0)
                 )
-
         # Compute PSNR in dB
         mse = torch.mean((x_clean.float() - x_obf.float()) ** 2).item()
         psnr = 10.0 * math.log10(1.0 / max(mse, 1e-10))
@@ -434,7 +432,6 @@ def train(
     generator = build_generator(config).to(device)
     # Offset RNG per shard after generator init so data shuffling and EOT augmentations vary across shards
     set_seed(seed + shard_id * 101)
-
     train_loader, val_loader = create_train_val_dataloaders(
         data_dir=data_dir,
         resolution=resolution,
@@ -446,6 +443,7 @@ def train(
         num_shards=num_shards,
         shard_id=shard_id,
     )
+
     ckpt_to_load = init_checkpoint or train_cfg.get("init_checkpoint")
     if ckpt_to_load and Path(ckpt_to_load).exists():
         ckpt_data = torch.load(ckpt_to_load, map_location=device, weights_only=False)

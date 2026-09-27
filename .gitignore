@@ -1,19 +1,50 @@
+# Deep Learning model weights & checkpoints
+*.pt
+*.onnx
+*.tar
+weights/
+checkpoints/
+runs/
+trained_model/
+
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
 *.egg-info/
 dist/
 build/
-.venv/
-venv/
 .pytest_cache/
-runs/
-checkpoints/
-trained_model/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Cache & Environment configs
 .snowflake_hf_cache/
 .env
-*.onnx
-*.pt
-*.tar
+
+# Generated modified output images & tests
+modified_*
+test_*
+output_*
 WIN_*.jpg
 WIN_*.png
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Pictures and static assets
+*.png
+!UI_1/public/**
+!Frontend/concealed/public/**
+
+# Mockups
+mockups/

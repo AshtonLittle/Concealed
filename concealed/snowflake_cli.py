@@ -698,7 +698,6 @@ def main() -> None:
             print(f"[Local] Cleared local checkpoint directory: {out_dir}")
         print("All Snowflake stages and local checkpoints have been wiped clean. Ready to train from scratch!")
         return
-
     # Handle --status across all accounts
     if args.status is not None:
         from snowflake.ml.jobs import get_job, list_jobs
