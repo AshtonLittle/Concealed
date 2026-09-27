@@ -73,6 +73,7 @@ async def probe_transformer_models(
     models: Optional[str] = Form(None, description="Comma-separated model IDs to probe, or 'all'"),
     model_engine: Optional[str] = Form("onnx", description="Model engine used if auto-generating obfuscated counterpart"),
     epsilon: float = Form(8.0, ge=0.5, le=64.0, description="Epsilon budget used when auto-generating the concealed image"),
+    mode: Optional[str] = Form("HYBRID", description="Protection mode (HYBRID, CANONICAL, NATIVE)"),
 ) -> ProbeResponse:
     """Probe Vision Transformers and VLMs with a text prompt on Clean vs Concealed image."""
     try:
@@ -99,6 +100,7 @@ async def probe_transformer_models(
             model_ids=model_id_list,
             model_engine=model_engine,
             epsilon=epsilon,
+            mode=mode,
         )
         return res
     except Exception as e:
@@ -115,6 +117,7 @@ async def probe_siglip_options(
     options: str = Form("face, person, readable text, dog, car", description="Comma-separated or JSON list of options to test"),
     model_engine: Optional[str] = Form("onnx", description="Model engine used if auto-generating obfuscated counterpart"),
     epsilon: float = Form(8.0, ge=0.5, le=64.0, description="Epsilon budget used when auto-generating the concealed image"),
+    mode: Optional[str] = Form("HYBRID", description="Protection mode (HYBRID, CANONICAL, NATIVE)"),
 ) -> SiglipProbeResponse:
     """Probe user options with real Google SigLIP comparing Clean vs Concealed image."""
     try:
@@ -153,6 +156,7 @@ async def probe_siglip_options(
             options=opts_list,
             model_engine=model_engine,
             epsilon=epsilon,
+            mode=mode,
         )
         return res
     except Exception as e:

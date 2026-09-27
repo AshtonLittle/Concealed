@@ -403,6 +403,7 @@ class ObfuscationService:
         clean_rgb: np.ndarray,
         model_engine: Optional[str] = None,
         epsilon: float = 8.0,
+        mode: Optional[str] = "HYBRID",
     ) -> np.ndarray:
         """Run single image obfuscation directly on a uint8 RGB numpy array."""
         target = (model_engine or self.active_image_model or "onnx").lower()
@@ -415,7 +416,13 @@ class ObfuscationService:
                 return np.clip(clean_rgb.astype(np.float32) + delta, 0, 255).astype(np.uint8)
             except Exception as e:
                 print(f"[ObfuscationService] Engine error ({e}), falling back to DCT.")
-        params = ObfuscationParams(epsilon=epsilon, mode=SynthesisModeEnum.HYBRID)
+        synth_mode = SynthesisModeEnum.HYBRID
+        if mode:
+            try:
+                synth_mode = SynthesisModeEnum(mode.upper())
+            except Exception:
+                synth_mode = SynthesisModeEnum.HYBRID
+        params = ObfuscationParams(epsilon=epsilon, mode=synth_mode)
         delta = self._synthesize_delta(clean_rgb, params)
         return np.clip(clean_rgb.astype(np.float32) + delta, 0, 255).astype(np.uint8)
 
@@ -427,6 +434,7 @@ class ObfuscationService:
         model_ids: Optional[List[str]] = None,
         model_engine: Optional[str] = None,
         epsilon: float = 8.0,
+        mode: Optional[str] = "HYBRID",
     ) -> Any:
         """Run full evaluation comparing Clean vs Concealed perception across Vision Transformers."""
         eps = float(epsilon) if epsilon is not None else 8.0
@@ -435,7 +443,7 @@ class ObfuscationService:
             obfuscated_image_bytes=obfuscated_image_bytes,
             prompt=prompt,
             model_ids=model_ids,
-            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine, epsilon=eps),
+            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine, epsilon=eps, mode=mode),
             obfuscation_epsilon=eps,
         )
 
@@ -446,6 +454,7 @@ class ObfuscationService:
         options: Optional[List[str]] = None,
         model_engine: Optional[str] = None,
         epsilon: float = 8.0,
+        mode: Optional[str] = "HYBRID",
     ) -> Any:
         """Run real Google SigLIP confidence evaluation on user-provided options."""
         eps = float(epsilon) if epsilon is not None else 8.0
@@ -453,7 +462,7 @@ class ObfuscationService:
             clean_image_bytes=clean_image_bytes,
             obfuscated_image_bytes=obfuscated_image_bytes,
             options=options,
-            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine, epsilon=eps),
+            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine, epsilon=eps, mode=mode),
             obfuscation_epsilon=eps,
         )
 

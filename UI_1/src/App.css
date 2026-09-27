@@ -5681,6 +5681,13 @@
   margin: 0;
 }
 
+.siglip-header-tags-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .siglip-engine-tag {
   display: inline-flex;
   align-items: center;
@@ -5691,6 +5698,12 @@
   padding: 6px 12px;
   font-size: 11px;
   color: #cbd5e1;
+}
+
+.siglip-engine-tag.params-tag {
+  background: rgba(56, 189, 248, 0.08);
+  border-color: rgba(56, 189, 248, 0.28);
+  color: #e0f2fe;
 }
 
 .siglip-model-label {
