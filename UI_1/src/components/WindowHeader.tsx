@@ -1,6 +1,6 @@
 import React from 'react';
 
-export type AppView = 'image' | 'video' | 'benchmark';
+export type AppView = 'image' | 'video' | 'feature-obscuring' | 'benchmark';
 
 interface WindowHeaderProps {
   currentView?: AppView;
@@ -31,31 +31,57 @@ export const WindowHeader: React.FC<WindowHeaderProps> = ({
         </button>
       </div>
 
-      {/* Center: Workspace Navigation Tabs (IMAGE & VIDEO) */}
+      {/* Center: Workspace Navigation Tabs (Two Distinct Functional Groups) */}
       <div className="topbar-center">
-        <nav className="nav-segmented-group" role="tablist" aria-label="Workspace navigation">
-          {/* IMAGE Tab */}
-          <button
-            type="button"
-            role="tab"
-            aria-selected={currentView === 'image'}
-            className={`nav-segmented-tab ${currentView === 'image' ? 'active' : ''}`}
-            onClick={() => onNavigate?.('image')}
-          >
-            IMAGE
-          </button>
+        <div className="topbar-nav-groups" role="navigation" aria-label="Workspace navigation">
+          {/* Tab Group 1: Global AI Concealing (IMAGE & VIDEO) */}
+          <div className="nav-tab-group-container">
+            <span className="nav-tab-group-label">AI Concealing</span>
+            <div className="nav-segmented-group" role="tablist" aria-label="AI Concealing modes">
+              {/* IMAGE Tab */}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={currentView === 'image'}
+                className={`nav-segmented-tab ${currentView === 'image' ? 'active' : ''}`}
+                onClick={() => onNavigate?.('image')}
+              >
+                IMAGE
+              </button>
 
-          {/* VIDEO Tab */}
-          <button
-            type="button"
-            role="tab"
-            aria-selected={currentView === 'video'}
-            className={`nav-segmented-tab ${currentView === 'video' ? 'active' : ''}`}
-            onClick={() => onNavigate?.('video')}
-          >
-            VIDEO
-          </button>
-        </nav>
+              {/* VIDEO Tab */}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={currentView === 'video'}
+                className={`nav-segmented-tab ${currentView === 'video' ? 'active' : ''}`}
+                onClick={() => onNavigate?.('video')}
+              >
+                VIDEO
+              </button>
+            </div>
+          </div>
+
+          {/* Visual Divider between Groups */}
+          <div className="nav-groups-separator" aria-hidden="true" />
+
+          {/* Tab Group 2: Targeted Feature Obscuring */}
+          <div className="nav-tab-group-container">
+            <span className="nav-tab-group-label">Targeted</span>
+            <div className="nav-segmented-group nav-segmented-group-feature" role="tablist" aria-label="Feature Obscuring mode">
+              {/* FEATURE OBSCURING Tab */}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={currentView === 'feature-obscuring'}
+                className={`nav-segmented-tab ${currentView === 'feature-obscuring' ? 'active' : ''}`}
+                onClick={() => onNavigate?.('feature-obscuring')}
+              >
+                FEATURE OBSCURING
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="topbar-right" />

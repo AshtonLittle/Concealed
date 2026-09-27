@@ -4,6 +4,7 @@ import { Sidebar } from './components/Sidebar';
 import { SettingsSidebar } from './components/SettingsSidebar';
 import { MainWorkspace } from './components/MainWorkspace';
 import { VideoWorkspace } from './components/VideoWorkspace';
+import { FeatureObscuringWorkspace } from './components/FeatureObscuringWorkspace';
 import type { AppView } from './components/WindowHeader';
 import './App.css';
 
@@ -25,18 +26,19 @@ export function App() {
       <Sidebar
         isOpen={isSidebarOpen}
         onToggle={() => setIsSidebarOpen((prev) => !prev)}
-        currentView={currentView === 'video' ? 'video' : 'image'}
+        currentView={currentView}
       />
 
       {/* Middle Column: Centered Workspace */}
       {currentView === 'image' && <MainWorkspace />}
+      {currentView === 'feature-obscuring' && <FeatureObscuringWorkspace />}
       {currentView === 'video' && <VideoWorkspace />}
 
       {/* Right Column: Settings (Mirrors Left Column) */}
       <SettingsSidebar
         isOpen={isSettingsOpen}
         onToggle={() => setIsSettingsOpen((prev) => !prev)}
-        currentView={currentView === 'video' ? 'video' : 'image'}
+        currentView={currentView}
       />
     </WindowFrame>
   );
