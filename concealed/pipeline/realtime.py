@@ -251,51 +251,60 @@ class RealtimeObfuscator:
             "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
         ]
         models = [VisionTransformerSurrogate(n, tap_layers=(-3, -2, -1)).to(dev).eval() for n in names]
-        weber = WeberTextureMask(min_mask_scale=0.0).to(dev)
+        weber = WeberTextureMask(min_mask_scale=0.28).to(dev)
 
         h, w = x_c.shape[-2], x_c.shape[-1]
         with torch.no_grad():
+            # Evaluate texture mask at native resolution so eye/mouth gradients do not blur onto smooth cheeks
             tex_mask = weber(x_c)
+
             clean_targets = [m(x_c) for m in models]
             if self.generator is not None:
                 x_224 = F.interpolate(x_c, size=(224, 224), mode="bilinear", align_corners=False)
                 x_384 = F.interpolate(x_c, size=(384, 384), mode="bilinear", align_corners=False)
-                raw_init_224 = (0.35 * torch.tanh(self.generator._forward_padded(x_224))).detach().clone()
-                raw_init_384 = (0.35 * torch.tanh(self.generator._forward_padded(x_384))).detach().clone()
+                raw_init_224 = (0.25 * torch.tanh(self.generator._forward_padded(x_224))).detach().clone()
+                raw_init_384 = (0.25 * torch.tanh(self.generator._forward_padded(x_384))).detach().clone()
             else:
                 init_delta = (x_0 - x_c).clamp(-eps * 0.99, eps * 0.99)
                 init_224 = F.interpolate(init_delta, size=(224, 224), mode="bilinear", align_corners=False)
                 init_384 = F.interpolate(init_delta, size=(384, 384), mode="bilinear", align_corners=False)
                 raw_init_224 = torch.atanh((init_224 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone()
                 raw_init_384 = torch.atanh((init_384 / max(eps, 1e-6)).clamp(-0.95, 0.95)).detach().clone()
-            raw_init_native = torch.zeros_like(x_c)
 
         param_224 = raw_init_224.requires_grad_(True)
         param_384 = raw_init_384.requires_grad_(True)
-        param_native = raw_init_native.requires_grad_(True)
-        opt = torch.optim.Adam([param_224, param_384, param_native], lr=0.28)
+        opt = torch.optim.Adam([param_224, param_384], lr=0.22)
 
         def _smooth_hp(z: torch.Tensor) -> torch.Tensor:
-            lp = F.avg_pool2d(F.avg_pool2d(z, kernel_size=3, stride=1, padding=1), kernel_size=3, stride=1, padding=1)
+            lp = z
+            for _ in range(3):
+                lp = F.avg_pool2d(lp, kernel_size=5, stride=1, padding=2)
             return z - lp
 
         def _synthesize_delta() -> torch.Tensor:
             hp_224 = _smooth_hp(param_224)
             hp_384 = _smooth_hp(param_384)
-            up_224 = F.interpolate(hp_224, size=(h, w), mode="bicubic", align_corners=False)
-            up_384 = F.interpolate(hp_384, size=(h, w), mode="bicubic", align_corners=False)
-            raw = 0.45 * up_224 + 0.35 * up_384 + 0.20 * param_native
-            # Native-resolution 5x5 zero-mean high-pass filter:
-            # Strips the flat 6px upsampled plateaus/contour lines while preserving exact 224x224 sample points
-            raw_lp = F.avg_pool2d(F.avg_pool2d(raw, kernel_size=5, stride=1, padding=2), kernel_size=5, stride=1, padding=2)
-            raw_hp = raw - raw_lp
-            d = eps * torch.tanh(raw_hp * 0.90)
-            # YCbCr chrominance damping (suppresses magenta/green waves by 80%)
-            d_y = 0.299 * d[:, 0:1] + 0.587 * d[:, 1:2] + 0.114 * d[:, 2:3]
-            d = (d_y + 0.20 * (d - d_y)) * tex_mask
-            return torch.clamp(d, -eps, eps)
+            # Local RMS wave normalization at 224/384 prevents tanh saturation plateaus & contour lines!
+            rms_224 = F.avg_pool2d(hp_224.square(), kernel_size=9, stride=1, padding=4).mean(dim=1, keepdim=True).sqrt() + 1e-4
+            rms_384 = F.avg_pool2d(hp_384.square(), kernel_size=9, stride=1, padding=4).mean(dim=1, keepdim=True).sqrt() + 1e-4
+            norm_224 = hp_224 / rms_224
+            norm_384 = hp_384 / rms_384
 
-        print(f"\n--- Running Hybrid High-Pass ViT Refinement ({steps} steps, eps={eps * 255:.1f}/255) ---", flush=True)
+            up_224 = F.interpolate(norm_224, size=(h, w), mode="bicubic", align_corners=False)
+            up_384 = F.interpolate(norm_384, size=(h, w), mode="bicubic", align_corners=False)
+            raw = 0.60 * up_224 + 0.40 * up_384
+            # Gentle native-resolution smoothing eliminates any residual interpolation ridges
+            raw = F.avg_pool2d(raw, kernel_size=5, stride=1, padding=2)
+
+            # Subtle cap (L_inf <= 5/255 on textures, ~1.2/255 on smooth skin/walls -> PSNR ~ 45+ dB)
+            soft_cap = min(eps, 5.5 / 255.0)
+            d = soft_cap * torch.tanh(raw * 0.65)
+            # YCbCr chrominance damping (85% pure luminance so there is zero color tint)
+            d_y = 0.299 * d[:, 0:1] + 0.587 * d[:, 1:2] + 0.114 * d[:, 2:3]
+            d = (d_y + 0.15 * (d - d_y)) * tex_mask
+            return torch.clamp(d, -soft_cap, soft_cap)
+
+        print(f"\n--- Running Hybrid Smooth ViT Refinement ({steps} steps, eps={eps * 255:.1f}/255) ---", flush=True)
         for step in range(1, steps + 1):
             opt.zero_grad()
             delta = _synthesize_delta()

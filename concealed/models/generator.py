@@ -193,7 +193,7 @@ class WeberTextureMask(nn.Module):
     perturbations while textured regions use the full epsilon budget.
     """
 
-    def __init__(self, min_mask_scale: float = 0.05) -> None:
+    def __init__(self, min_mask_scale: float = 0.28) -> None:
         super().__init__()
         self.min_mask_scale = min_mask_scale
         sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]) / 8.0
@@ -205,12 +205,11 @@ class WeberTextureMask(nn.Module):
         lum = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
         grads = F.conv2d(F.pad(lum, (1, 1, 1, 1), mode="reflect"), self.sobel_kernels)
         mag = torch.sqrt(grads[:, 0:1] ** 2 + grads[:, 1:2] ** 2 + 1e-8)
-        # Tight 5x5 native-resolution pooling (2px radius at 720p) avoids halo bleed onto smooth skin
-        energy = F.avg_pool2d(mag, kernel_size=5, stride=1, padding=2)
+        # Native-resolution 7x7 smoothing keeps smooth cheeks/foreheads at min_mask_scale without 180px halo bleed
+        energy = F.avg_pool2d(F.avg_pool2d(mag, kernel_size=7, stride=1, padding=3), kernel_size=7, stride=1, padding=3)
         mean_e = energy.mean(dim=(-2, -1), keepdim=True).clamp(min=0.004)
-        # Dead-zone below 0.55 * mean_e keeps flat walls & smooth foreheads/cheeks completely untouched
-        above_smooth = F.relu((energy / mean_e) - 0.55)
-        normalized = torch.tanh(above_smooth * 1.4)
+        above_flat = F.relu((energy / mean_e) - 0.55)
+        normalized = torch.tanh(above_flat * 1.35)
         return self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
 
 
@@ -412,16 +411,18 @@ class AmortizedObfuscationGenerator(nn.Module):
 
             alpha = self.hybrid_global_weight
             raw_blended = alpha * raw_global + (1.0 - alpha) * raw_local
-            delta = self.epsilon * torch.tanh(raw_blended)
+            # Smooth out upsampled zero-crossing ridges before bounding
+            raw_blended = F.avg_pool2d(raw_blended, kernel_size=5, stride=1, padding=2)
+            delta = self.epsilon * torch.tanh(raw_blended * 0.75)
 
         else:
             raise ValueError(f"Unsupported synthesis mode: {active_mode}")
 
         # YCbCr Opponent Chrominance Damping:
-        # Suppress magenta/green (+G vs -R/-B) chromatic waves by 70% while keeping full luminance/edge budget.
+        # Suppress magenta/green (+G vs -R/-B) chromatic waves by 80% while keeping full luminance budget.
         delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
         delta_chroma = delta - delta_y
-        delta = delta_y + 0.30 * delta_chroma
+        delta = delta_y + 0.20 * delta_chroma
 
         if self.luminance_texture_masking:
             mask = self.texture_mask(x)
