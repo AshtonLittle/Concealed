@@ -162,12 +162,17 @@ export const FeatureObscuringWorkspace: React.FC = () => {
     <main className="main-workspace feature-obscuring-workspace" aria-label="Feature Obscuring workspace">
       <div className="workspace-content feature-obscuring-content">
         
-        {/* Workspace Title & Description */}
+        {/* Workspace Title & Disclaimer Banner */}
         <div className="feature-obscuring-header">
-          <h2 className="feature-header-title">Targeted Feature Obscuring</h2>
-          <p className="feature-header-subtitle">
-            Detect specific visual features conforming to object silhouettes using neural vision models, and apply localized AI privacy protection.
-          </p>
+          <div className="feature-disclaimer-card">
+            <div className="feature-disclaimer-top">
+              <span className="feature-disclaimer-pill">TARGETED PRIVACY NOTICE</span>
+              <h2 className="feature-header-title">Targeted Feature Obscuring</h2>
+            </div>
+            <p className="feature-header-subtitle">
+              Detects and isolates specific visual features (such as <strong>faces</strong>, <strong>people</strong>, <strong>text</strong>, or <strong>objects</strong>) conforming strictly to silhouette contours using neural vision models, applying localized AI privacy protection while preserving the surrounding image untouched.
+            </p>
+          </div>
         </div>
 
         <div className="feature-obscuring-grid">
