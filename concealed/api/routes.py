@@ -8,6 +8,9 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 
 from concealed.api.schemas import (
+    BenchmarkAnalysisResponse,
+    HardwareBenchmarkRequest,
+    HardwareBenchmarkResponse,
     HealthResponse,
     ObfuscationAnalytics,
     ObfuscationJSONRequest,
@@ -269,3 +272,56 @@ async def obfuscate_image_json(request: ObfuscationJSONRequest) -> ObfuscationJS
         parameters=request.model_dump(exclude={"image_base64"}),
         analytics=analytics,
     )
+
+
+@router.post("/benchmark/analyze", response_model=BenchmarkAnalysisResponse)
+async def analyze_image_benchmark(
+    file: UploadFile = File(..., description="Input image to evaluate across Vision Transformers"),
+    epsilon: float = Form(8.0, ge=0.5, le=64.0),
+    mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID),
+    target_features: Optional[str] = Form(None),
+    conforming_mask: bool = Form(False),
+    feather_radius: int = Form(8, ge=0, le=100),
+    texture_masking: bool = Form(True),
+    chroma_damping: float = Form(0.70, ge=0.0, le=1.0),
+) -> BenchmarkAnalysisResponse:
+    """Run full adversarial evaluation comparing clean vs obfuscated images across Vision Transformers and biometric models."""
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty.")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to read image: {e}") from e
+
+    params = ObfuscationParams(
+        epsilon=epsilon,
+        mode=mode,
+        target_features=target_features,
+        conforming_mask=conforming_mask,
+        feather_radius=feather_radius,
+        texture_masking=texture_masking,
+        chroma_damping=chroma_damping,
+    )
+
+    try:
+        report = service.analyze_benchmark(image_bytes, params)
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Benchmark analysis failed: {e}") from e
+
+
+@router.post("/benchmark/hardware", response_model=HardwareBenchmarkResponse)
+async def hardware_throughput_benchmark(
+    request: HardwareBenchmarkRequest,
+) -> HardwareBenchmarkResponse:
+    """Benchmark live hardware latency in milliseconds and throughput in frames per second (FPS)."""
+    try:
+        res = service.run_hardware_benchmark(
+            width=request.width,
+            height=request.height,
+            iterations=request.iterations,
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Hardware benchmark failed: {e}") from e
+

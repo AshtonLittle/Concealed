@@ -168,3 +168,54 @@ class HealthResponse(BaseModel):
     version: str = "0.1.0"
     supported_formats: List[str] = ["PNG", "JPEG", "WEBP"]
     supported_modes: List[str] = ["hybrid", "canonical_residual", "native"]
+
+
+class ModelBenchmarkReport(BaseModel):
+    """Detailed evasion and suppression report for an individual surrogate model."""
+
+    model_name: str
+    architecture: str
+    target_class: str
+    patch_cosine_sim: float
+    salient_patch_cos: float
+    global_cos: float
+    concealed_patches_pct: float
+    reid_evasion_pct: float
+    raw_score: str
+    post_concealed_score: str
+    resistance_delta_pct: float
+    evasion_status: str
+
+
+class BenchmarkAnalysisResponse(BaseModel):
+    """Comprehensive benchmark analysis comparing clean vs obfuscated image."""
+
+    success: bool = True
+    clean_image_url: str
+    obfuscated_image_url: str
+    diff_heatmap_url: str
+    original_resolution: Tuple[int, int]
+    stealth_metrics: ObfuscationAnalytics
+    models: List[ModelBenchmarkReport]
+
+
+class HardwareBenchmarkRequest(BaseModel):
+    """Configuration for live hardware latency & FPS benchmark."""
+
+    width: int = Field(default=1920, ge=128, le=3840)
+    height: int = Field(default=1080, ge=128, le=2160)
+    iterations: int = Field(default=10, ge=1, le=50)
+
+
+class HardwareBenchmarkResponse(BaseModel):
+    """Live latency and throughput benchmark result."""
+
+    resolution: str
+    width: int
+    height: int
+    iterations: int
+    avg_latency_ms: float
+    throughput_fps: float
+    device: str
+    backend: str
+

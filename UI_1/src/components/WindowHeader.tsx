@@ -14,7 +14,7 @@ export const WindowHeader: React.FC<WindowHeaderProps> = ({
   return (
     <header className="window-header" aria-label="Application title bar">
       <div className="topbar-left" role="presentation">
-        {/* Classic CONCEALED wordmark on the far left */}
+        {/* Classic CONCEALED wordmark on the far left with stylized logo emblem */}
         <button
           type="button"
           className="concealed-title-btn"
@@ -22,6 +22,9 @@ export const WindowHeader: React.FC<WindowHeaderProps> = ({
           aria-label="Return to image workspace"
           title="Return to image workspace"
         >
+          <div className="topbar-logo-emblem" aria-hidden="true">
+            <img src="/logo_white_cropped.png" alt="" className="topbar-logo-img" />
+          </div>
           <span className="concealed-classic-title">CONCEALED</span>
         </button>
 
