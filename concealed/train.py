@@ -167,9 +167,7 @@ def merge_generator_checkpoints(
         p_cos = raw_p if math.isfinite(raw_p) else 0.80
         raw_s = float(m.get("salient_patch_cos", p_cos))
         s_cos = raw_s if math.isfinite(raw_s) else p_cos
-        raw_flip = float(m.get("semantic_neighbor_flip_pct", 0.0))
-        sem_flip = raw_flip if math.isfinite(raw_flip) else 0.0
-        score = (1.0 - p_cos) + 0.5 * (1.0 - s_cos) + 0.003 * sem_flip
+        score = (1.0 - p_cos) + 0.5 * (1.0 - s_cos)
         scores.append(score)
 
     score_tensor = torch.tensor(scores, dtype=torch.float64)
@@ -279,8 +277,10 @@ def validate(
 
     for batch_idx, x_clean in enumerate(val_loader):
         x_clean = x_clean.to(device, non_blocking=True)
+        # Run the lightweight 8MB generator in float32 so GroupNorm/Conv activations never overflow fp16
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            x_obf, delta = generator(x_clean.float(), return_delta=True)
         with torch.amp.autocast(device_type=device.type, dtype=val_amp_dtype, enabled=use_amp):
-            x_obf, delta = generator(x_clean, return_delta=True)
             clean_outputs = surrogates(x_clean)
             obf_outputs = surrogates(x_obf)
         # Compute loss & stealth metrics in float32 to prevent fp16 overflow on high-contrast batches
@@ -289,15 +289,25 @@ def validate(
         for c_out, o_out in zip(clean_outputs, obf_outputs):
             short_name = o_out.name.split("/")[-1]
             c_g = torch.nan_to_num(c_out.global_embedding.detach().float(), nan=0.0)
-            o_g = torch.nan_to_num(o_out.global_embedding.detach().float(), nan=0.0)
+            o_g_raw = o_out.global_embedding.detach().float()
+            # Never replace NaN with 0.0 (which has 0.0 self-similarity and inflates Re-ID evasion to 99.4%);
+            # if a sample ever overflows, fall back to clean c_g so it counts as 0% evasion.
+            finite_mask = torch.isfinite(o_g_raw).all(dim=-1, keepdim=True)
+            o_g = torch.where(finite_mask, torch.nan_to_num(o_g_raw, nan=0.0), c_g)
             clean_glob_gallery.setdefault(short_name, []).append(c_g.cpu())
             obf_glob_gallery.setdefault(short_name, []).append(o_g.cpu())
             if c_out.patch_tokens and o_out.patch_tokens:
                 # Pool final tapped layer's patch tokens into a spatial-structural descriptor
                 cp_raw = torch.nan_to_num(c_out.patch_tokens[-1].detach().float(), nan=0.0)
-                op_raw = torch.nan_to_num(o_out.patch_tokens[-1].detach().float(), nan=0.0)
+                op_raw = o_out.patch_tokens[-1].detach().float()
                 cp_desc = torch.nn.functional.normalize(cp_raw.mean(dim=1), p=2, dim=-1)
-                op_desc = torch.nn.functional.normalize(op_raw.mean(dim=1), p=2, dim=-1)
+                op_mean = op_raw.mean(dim=1)
+                op_finite = torch.isfinite(op_mean).all(dim=-1, keepdim=True)
+                op_desc = torch.where(
+                    op_finite,
+                    torch.nn.functional.normalize(torch.nan_to_num(op_mean, nan=0.0), p=2, dim=-1),
+                    cp_desc,
+                )
                 clean_patch_gallery.setdefault(short_name, []).append(cp_desc.cpu())
                 obf_patch_gallery.setdefault(short_name, []).append(op_desc.cpu())
 
