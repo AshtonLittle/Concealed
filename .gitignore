@@ -1,15 +1,23 @@
-# YOLO and Deep Learning model weights
-# (Ultralytics and OpenCV auto-download these locally on first run)
+# Deep Learning model weights, caches & checkpoints
 *.pt
 *.onnx
+*.tar
 weights/
+checkpoints/
+trained_model/
+runs/
+.snowflake_hf_cache/
 
-# Python bytecode and caches
+# Python bytecode, builds & caches
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
 
 # Virtual environments
 venv/
@@ -17,19 +25,26 @@ venv/
 env/
 ENV/
 
-# Generated modified output images
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Output images & camera test captures
 modified_*
 test_*
 output_*
+WIN_*.jpg
+WIN_*.png
+
+# Pictures
+*.png
+
+# Mockups
+mockups/
 
 # OS and IDE files
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-#pictures
-*.png
-
-# Mockups
-mockups/
