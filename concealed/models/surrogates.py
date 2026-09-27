@@ -165,9 +165,9 @@ class VisionTransformerSurrogate(nn.Module):
             self.model, self.input_size, mean, std, self.has_cls_token = self._load_hf_vision_model(
                 self.model_name, pretrained=pretrained
             )
-            # Also attach fallback hooks for custom VLM/OCR vision towers (e.g., GLM-OCR, Qwen-Image-2.1)
-            # that may not populate HuggingFace's standard `outputs.hidden_states` tuple.
-            self._register_module_hooks(self.model)
+            # Only attach fallback hooks for custom VLM/OCR vision towers that may not populate outputs.hidden_states
+            if self.model.__class__.__name__ not in ("SiglipVisionModel", "CLIPVisionModel", "Dinov2Model"):
+                self._register_module_hooks(self.model)
 
         self.register_buffer("mean", torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1))
@@ -226,8 +226,14 @@ class VisionTransformerSurrogate(nn.Module):
             has_cls = True
 
         if pretrained:
+            def _load_cached_first(loader_fn, repo_id: str, **kwargs):
+                try:
+                    return loader_fn(repo_id, local_files_only=True, **kwargs)
+                except Exception:
+                    return loader_fn(repo_id, **kwargs)
+
             try:
-                processor = AutoImageProcessor.from_pretrained(model_name, trust_remote_code=True)
+                processor = _load_cached_first(AutoImageProcessor.from_pretrained, model_name, trust_remote_code=True)
                 mean = tuple(getattr(processor, "image_mean", default_mean))
                 std = tuple(getattr(processor, "image_std", default_std))
                 size_dict = getattr(processor, "size", {})
@@ -242,15 +248,16 @@ class VisionTransformerSurrogate(nn.Module):
                 mean, std, img_h, img_w = default_mean, default_std, default_size, default_size
 
             if "siglip" in lower_name:
-                model = SiglipVisionModel.from_pretrained(model_name)
+                model = _load_cached_first(SiglipVisionModel.from_pretrained, model_name)
             elif "clip" in lower_name:
-                model = CLIPVisionModel.from_pretrained(model_name)
+                model = _load_cached_first(CLIPVisionModel.from_pretrained, model_name)
             elif "dinov2" in lower_name:
-                model = Dinov2Model.from_pretrained(model_name)
+                model = _load_cached_first(Dinov2Model.from_pretrained, model_name)
             else:
                 import gc
 
-                full_model = AutoModel.from_pretrained(
+                full_model = _load_cached_first(
+                    AutoModel.from_pretrained,
                     model_name,
                     trust_remote_code=True,
                     torch_dtype="auto",
@@ -529,7 +536,7 @@ def build_surrogate_ensemble(
     sur_cfg = config.get("surrogates", config)
     model_specs = sur_cfg.get(key, [])
     tap_layers = sur_cfg.get("tap_layers", [-4, -2, -1])
-    sequential_offload = sur_cfg.get("sequential_offload", False)
+    sequential_offload = bool(sur_cfg.get("sequential_offload", sur_cfg.get("cpu_offload", False)))
     return SurrogateEnsemble(
         model_specs=model_specs,
         tap_layers=tap_layers,

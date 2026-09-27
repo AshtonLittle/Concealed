@@ -163,11 +163,10 @@ def merge_generator_checkpoints(
     scores: list[float] = []
     for c in ckpts:
         m = c.get("metrics", {})
-        raw_p = float(m.get("patch_cos_sim", 0.80))
-        p_cos = raw_p if math.isfinite(raw_p) else 0.80
-        raw_s = float(m.get("salient_patch_cos", p_cos))
-        s_cos = raw_s if math.isfinite(raw_s) else p_cos
-        score = (1.0 - p_cos) + 0.5 * (1.0 - s_cos)
+        p_cos = float(m.get("patch_cos_sim", 0.85))
+        s_cos = float(m.get("salient_patch_cos", p_cos))
+        sem_flip = float(m.get("semantic_neighbor_flip_pct", 0.0))
+        score = (1.0 - p_cos) + 0.5 * (1.0 - s_cos) + 0.003 * sem_flip
         scores.append(score)
 
     score_tensor = torch.tensor(scores, dtype=torch.float64)
@@ -177,6 +176,38 @@ def merge_generator_checkpoints(
     if base_checkpoint is not None and Path(base_checkpoint).exists():
         base_raw = torch.load(base_checkpoint, map_location=device, weights_only=False)
         base_sd = base_raw.get("generator_state_dict", base_raw)
+
+    # If merging --from-scratch models without a shared warm-start base_checkpoint, pick the strongest worker
+    # to avoid hidden-channel permutation cancellation across independent random-init trajectories.
+    if base_sd is None:
+        best_idx = int(torch.argmax(score_tensor).item())
+        best_ckpt = ckpts[best_idx]
+        best_sd = best_ckpt.get("generator_state_dict", best_ckpt)
+        filtered_best = {k: v for k, v in best_sd.items() if k in target_sd and target_sd[k].shape == v.shape}
+        generator.load_state_dict(filtered_best, strict=False)
+        generator.to(device).eval()
+        best_metrics = best_ckpt.get("metrics", {})
+        merge_info = {
+            "num_merged": len(valid_paths),
+            "strategy": f"best_of_fleet (selected worker #{best_idx + 1}: {valid_paths[best_idx].parent.name})",
+            "weights": [1.0 if i == best_idx else 0.0 for i in range(len(valid_paths))],
+            "sources": [str(p) for p in valid_paths],
+            "task_vector_scaling": 1.0,
+            "metrics": best_metrics,
+        }
+        if output_path is not None:
+            out_p = Path(output_path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "generator_state_dict": generator.state_dict(),
+                "raw_generator_state_dict": generator.state_dict(),
+                "config": base_cfg,
+                "epoch": int(best_ckpt.get("epoch", 0)),
+                "metrics": best_metrics,
+                "merge_info": merge_info,
+            }
+            torch.save(payload, out_p)
+        return generator, merge_info
 
     merged_sd: Dict[str, torch.Tensor] = {}
     for k, ref_tensor in target_sd.items():
@@ -189,10 +220,8 @@ def merge_generator_checkpoints(
         for w, c in zip(weights, ckpts):
             sd = c.get("generator_state_dict", c)
             if k in sd and sd[k].shape == ref_tensor.shape:
-                t_cand = sd[k].to(device=device, dtype=torch.float32)
-                if torch.isfinite(t_cand).all():
-                    worker_tensors.append(t_cand)
-                    worker_weights.append(w)
+                worker_tensors.append(sd[k].to(device=device, dtype=torch.float32))
+                worker_weights.append(w)
 
         if not worker_tensors:
             merged_sd[k] = ref_tensor.clone()
@@ -214,23 +243,19 @@ def merge_generator_checkpoints(
     generator.load_state_dict(merged_sd, strict=False)
     generator.to(device).eval()
 
-    # Aggregate finite validation metrics weighted by worker weights
+    # Aggregate validation metrics weighted by worker weights
     merged_metrics: Dict[str, float] = {}
     all_metric_keys = set()
     for c in ckpts:
         all_metric_keys.update(c.get("metrics", {}).keys())
     for mk in sorted(all_metric_keys):
-        finite_pairs = [
-            (w, float(c.get("metrics", {})[mk]))
-            for w, c in zip(weights, ckpts)
-            if mk in c.get("metrics", {}) and math.isfinite(float(c.get("metrics", {})[mk]))
-        ]
-        if finite_pairs:
-            w_tot = sum(w for w, _ in finite_pairs) or 1.0
-            merged_metrics[mk] = round(float(sum(w * val for w, val in finite_pairs) / w_tot), 4)
+        vals = [float(c.get("metrics", {}).get(mk, 0.0)) for c in ckpts if mk in c.get("metrics", {})]
+        if vals:
+            merged_metrics[mk] = round(float(sum(w * float(c.get("metrics", {}).get(mk, vals[0])) for w, c in zip(weights, ckpts))), 4)
 
     merge_info = {
         "num_merged": len(valid_paths),
+        "strategy": "task_vector_soup",
         "weights": [round(w, 4) for w in weights],
         "sources": [str(p) for p in valid_paths],
         "task_vector_scaling": float(task_vector_scaling) if base_sd is not None else 1.0,
@@ -253,6 +278,7 @@ def merge_generator_checkpoints(
     return generator, merge_info
 
 
+
 @torch.no_grad()
 def validate(
     generator: AmortizedObfuscationGenerator,
@@ -265,70 +291,63 @@ def validate(
     """Run validation over val_loader and compute mean obfuscation, stealth, and feature identification metrics."""
     generator.eval()
     accum: Dict[str, float] = {}
-    valid_counts: Dict[str, int] = {}
+    count = 0
     use_amp = device.type == "cuda"
-    val_amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
     # Collect embeddings across the validation gallery to measure real Feature Identification & Semantic Flip rates
     clean_glob_gallery: Dict[str, list] = {}
     obf_glob_gallery: Dict[str, list] = {}
     clean_patch_gallery: Dict[str, list] = {}
     obf_patch_gallery: Dict[str, list] = {}
+    spatial_patch_evasion_accum: Dict[str, list[float]] = {}
 
     for batch_idx, x_clean in enumerate(val_loader):
         x_clean = x_clean.to(device, non_blocking=True)
-        # Run the lightweight 8MB generator in float32 so GroupNorm/Conv activations never overflow fp16
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            x_obf, delta = generator(x_clean.float(), return_delta=True)
-        with torch.amp.autocast(device_type=device.type, dtype=val_amp_dtype, enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            x_obf, delta = generator(x_clean, return_delta=True)
             clean_outputs = surrogates(x_clean)
             obf_outputs = surrogates(x_obf)
-        # Compute loss & stealth metrics in float32 to prevent fp16 overflow on high-contrast batches
-        _, metrics = loss_fn(x_clean.float(), x_obf.float(), delta.float(), clean_outputs, obf_outputs)
+            _, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
 
         for c_out, o_out in zip(clean_outputs, obf_outputs):
             short_name = o_out.name.split("/")[-1]
-            c_g = torch.nan_to_num(c_out.global_embedding.detach().float(), nan=0.0)
-            o_g_raw = o_out.global_embedding.detach().float()
-            # Never replace NaN with 0.0 (which has 0.0 self-similarity and inflates Re-ID evasion to 99.4%);
-            # if a sample ever overflows, fall back to clean c_g so it counts as 0% evasion.
-            finite_mask = torch.isfinite(o_g_raw).all(dim=-1, keepdim=True)
-            o_g = torch.where(finite_mask, torch.nan_to_num(o_g_raw, nan=0.0), c_g)
-            clean_glob_gallery.setdefault(short_name, []).append(c_g.cpu())
-            obf_glob_gallery.setdefault(short_name, []).append(o_g.cpu())
+            clean_glob_gallery.setdefault(short_name, []).append(c_out.global_embedding.detach().float().cpu())
+            obf_glob_gallery.setdefault(short_name, []).append(o_out.global_embedding.detach().float().cpu())
             if c_out.patch_tokens and o_out.patch_tokens:
+                cp_last = c_out.patch_tokens[-1].detach().float()
+                op_last = o_out.patch_tokens[-1].detach().float()
                 # Pool final tapped layer's patch tokens into a spatial-structural descriptor
-                cp_raw = torch.nan_to_num(c_out.patch_tokens[-1].detach().float(), nan=0.0)
-                op_raw = o_out.patch_tokens[-1].detach().float()
-                cp_desc = torch.nn.functional.normalize(cp_raw.mean(dim=1), p=2, dim=-1)
-                op_mean = op_raw.mean(dim=1)
-                op_finite = torch.isfinite(op_mean).all(dim=-1, keepdim=True)
-                op_desc = torch.where(
-                    op_finite,
-                    torch.nn.functional.normalize(torch.nan_to_num(op_mean, nan=0.0), p=2, dim=-1),
-                    cp_desc,
-                )
+                cp_desc = torch.nn.functional.normalize(cp_last.mean(dim=1), p=2, dim=-1)
+                op_desc = torch.nn.functional.normalize(op_last.mean(dim=1), p=2, dim=-1)
                 clean_patch_gallery.setdefault(short_name, []).append(cp_desc.cpu())
                 obf_patch_gallery.setdefault(short_name, []).append(op_desc.cpu())
+
+                # Spatial Patch Feature Re-ID Evasion (% of 196 local patches misidentified in the 14x14 spatial grid)
+                per_p_sim = (cp_last * op_last).sum(dim=-1)  # [B, N]
+                sim_grid = torch.bmm(op_last, cp_last.transpose(1, 2))  # [B, N, N]
+                matched_idx = torch.argmax(sim_grid, dim=-1)  # [B, N]
+                true_idx = torch.arange(cp_last.shape[1], device=cp_last.device).unsqueeze(0)
+                evaded_patches = (matched_idx != true_idx) | (per_p_sim < 0.50)
+                spatial_patch_evasion_accum.setdefault(short_name, []).append(
+                    float(evaded_patches.float().mean().item() * 100.0)
+                )
 
         # Compute PSNR in dB
         mse = torch.mean((x_clean.float() - x_obf.float()) ** 2).item()
         psnr = 10.0 * math.log10(1.0 / max(mse, 1e-10))
         metrics["psnr_db"] = psnr
-        metrics["linf_255"] = float(torch.max(torch.abs(delta.float())).item() * 255.0)
+        metrics["linf_255"] = float(torch.max(torch.abs(delta)).item() * 255.0)
 
         for k, v in metrics.items():
-            fv = float(v)
-            if math.isfinite(fv):
-                accum[k] = accum.get(k, 0.0) + fv
-                valid_counts[k] = valid_counts.get(k, 0) + 1
+            accum[k] = accum.get(k, 0.0) + v
+        count += 1
 
         if batch_idx == 0 and sample_out_path is not None:
             save_visual_comparison(x_clean.float(), x_obf.float(), delta.float(), sample_out_path)
 
-    summary = {k: v / max(valid_counts.get(k, 1), 1) for k, v in accum.items()}
+    summary = {k: v / max(count, 1) for k, v in accum.items()}
 
-    # Compute Gallery Feature Identification Evasion (%) and Semantic Neighbor Flip Rate (%) per Vision Transformer
+    # Compute Spatial Patch Feature Re-ID Evasion (%) and Gallery Semantic Neighbor Flip Rate (%) per Vision Transformer
     reid_evasion_list = []
     sem_flip_list = []
     for short_name, c_list in clean_glob_gallery.items():
@@ -348,9 +367,11 @@ def validate(
         top1_match = torch.argmax(sim_obf_to_clean, dim=-1)
         arange_idx = torch.arange(n_gal)
 
-        # Feature Identification Evaded if Top-1 match flips to a different image OR self-similarity drops < 0.65
-        evaded = (top1_match != arange_idx) | (diag_sim < 0.65)
-        evasion_pct = float(evaded.float().mean().item() * 100.0)
+        # Combine gallery-level Re-ID flip with spatial patch Re-ID evasion
+        gal_evaded = float(((top1_match != arange_idx) | (diag_sim < 0.65)).float().mean().item() * 100.0)
+        patch_ev_list = spatial_patch_evasion_accum.get(short_name, [])
+        patch_evaded = float(sum(patch_ev_list) / max(1, len(patch_ev_list))) if patch_ev_list else 0.0
+        evasion_pct = max(gal_evaded, patch_evaded)
         summary[f"reid_evasion_pct/{short_name}"] = evasion_pct
         reid_evasion_list.append(evasion_pct)
 
@@ -387,7 +408,7 @@ def train(
     seed = int(train_cfg.get("seed", 42))
     num_shards = max(1, int(train_cfg.get("num_shards", 1)))
     shard_id = int(train_cfg.get("shard_id", 0))
-    # Initialize with shared base seed first so all fleet workers share the exact same initial weight basin theta_0
+    # Initialize generator with shared base seed first so all fleet workers start from identical weights
     set_seed(seed)
 
     if device_str:
@@ -410,6 +431,10 @@ def train(
     if max_images is not None:
         max_images = int(max_images)
 
+    generator = build_generator(config).to(device)
+    # Offset RNG per shard after generator init so data shuffling and EOT augmentations vary across shards
+    set_seed(seed + shard_id * 101)
+
     train_loader, val_loader = create_train_val_dataloaders(
         data_dir=data_dir,
         resolution=resolution,
@@ -421,8 +446,6 @@ def train(
         num_shards=num_shards,
         shard_id=shard_id,
     )
-
-    generator = build_generator(config).to(device)
     ckpt_to_load = init_checkpoint or train_cfg.get("init_checkpoint")
     if ckpt_to_load and Path(ckpt_to_load).exists():
         ckpt_data = torch.load(ckpt_to_load, map_location=device, weights_only=False)
@@ -433,9 +456,6 @@ def train(
         }
         generator.load_state_dict(filtered_sd, strict=False)
         print(f"  [Warm-Start] Initialized generator weights from {ckpt_to_load}", flush=True)
-
-    # Vary augmentation / EOT / batch ordering RNG per shard after generator initialization
-    set_seed(seed + shard_id * 101)
 
     ema = ModelEMA(generator, decay=float(train_cfg.get("ema_decay", 0.995)))
 
@@ -471,10 +491,8 @@ def train(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    mp_mode = str(train_cfg.get("mixed_precision", "bf16")).lower()
+    mp_mode = str(train_cfg.get("mixed_precision", "fp16")).lower()
     use_amp = device.type == "cuda" and mp_mode in ("fp16", "bf16")
-    if use_amp and mp_mode == "fp16" and torch.cuda.is_bf16_supported():
-        mp_mode = "bf16"
     amp_dtype = torch.bfloat16 if mp_mode == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and mp_mode == "fp16"))
 
@@ -566,15 +584,12 @@ def train(
 
             if (idx + 1) % grad_accum == 0 or (idx + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
-                if torch.isfinite(grad_norm):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    ema.update(generator)
-                else:
-                    scaler.update()
+                torch.nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
+                ema.update(generator)
 
             for k, v in metrics.items():
                 epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v
@@ -592,17 +607,13 @@ def train(
                 elapsed_all = time.perf_counter() - train_start_time
                 eta_sec = (elapsed_all / max(done_total, 1)) * max(0, all_total - done_total)
                 eta_m, eta_s = int(eta_sec // 60), int(eta_sec % 60)
-                per_mod_live = " | ".join(
-                    f"{sn.split('-')[0]}:{metrics.get(f'patch_cos/{sn}', 0.0):.2f}({metrics.get(f'conc70/{sn}', 0.0):.0f}%)"
-                    for sn in model_short_names
-                )
                 print(
                     f"  [Live Step {idx + 1:03d}/{len(train_loader):03d} | Ep {epoch}/{epochs} | ETA {eta_m}m{eta_s:02d}s] "
                     f"PatchCos={metrics['patch_cos_sim']:.3f} | "
                     f"SalientCos={metrics.get('salient_patch_cos', 0.0):.3f} | "
                     f"GlobalCos={metrics['global_cos_sim']:.3f} | "
-                    f"Scrambled(<0.7)={metrics.get('concealed_patches_70_pct', 0.0):.1f}% | "
-                    f"[{per_mod_live}]",
+                    f"ConcealedPatches(<0.7)={metrics.get('concealed_patches_70_pct', 0.0):.1f}% | "
+                    f"ChromaRMS={metrics.get('chroma_rms_255', 0.0):.2f}/255",
                     flush=True,
                 )
 
@@ -640,47 +651,25 @@ def train(
             f"| Identification Stat: Feature ID Evasion = {val_summary.get('feature_reid_evasion_pct', 0.0):5.1f}% | Semantic Category Flip = {val_summary.get('semantic_neighbor_flip_pct', 0.0):5.1f}%\n"
             f"| Spatial Masking    : Patches <0.70 Sim  = {val_summary.get('concealed_patches_70_pct', 0.0):5.1f}% | Patches <0.50 Sim      = {val_summary.get('concealed_patches_50_pct', 0.0):5.1f}%\n"
             f"| Visual Stealth     : PSNR = {val_summary['psnr_db']:.2f} dB | Chroma Shift = {val_summary.get('chroma_rms_255', 0.0):.2f}/255 | L_inf = {val_summary['linf_255']:.2f}/255 | UAP Ratio = {val_summary.get('uap_collapse_ratio', 0.0):.3f}\n"
-            f"| Per-Transformer Evasion & Scramble Breakdown:",
+            f"| Per-Transformer Breakdown:",
             flush=True,
         )
         for s_name in model_short_names:
             p_c = val_summary.get(f"patch_cos/{s_name}", 0.0)
             s_c = val_summary.get(f"salient_cos/{s_name}", 0.0)
             g_c = val_summary.get(f"global_cos/{s_name}", 0.0)
-            c70 = val_summary.get(f"conc70/{s_name}", 0.0)
-            c50 = val_summary.get(f"conc50/{s_name}", 0.0)
             ev_p = val_summary.get(f"reid_evasion_pct/{s_name}", 0.0)
             fl_p = val_summary.get(f"semantic_flip_pct/{s_name}", 0.0)
-            status_tag = (
-                "[EVADED / SCRAMBLED]"
-                if (p_c < 0.72 or g_c < 0.55 or ev_p > 50.0)
-                else ("[PARTIALLY DISRUPTED]" if (p_c < 0.85 or ev_p > 25.0) else "[VULNERABLE]")
-            )
             print(
-                f"|   * {s_name:24s} {status_tag:21s} -> Patch: {p_c:.4f} (Salient: {s_c:.4f}) | Global: {g_c:.4f} | Grid(<0.7/<0.5): {c70:4.1f}%/{c50:4.1f}% | Re-ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
+                f"|   * {s_name:28s} -> PatchCos: {p_c:.4f} | SalientCos: {s_c:.4f} | GlobalCos: {g_c:.4f} | ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
                 flush=True,
             )
         print("+---------------------------------------------------------------------------------------+\n", flush=True)
 
-        # Save latest & best checkpoints (using composite evasion quality score, falling back to train if val had NaN)
+        # Save latest & best checkpoints
         save_checkpoint(out_dir / "latest_generator.pt", generator, ema, config, epoch, val_summary)
-        p_val = val_summary.get("patch_cos_sim", float("nan"))
-        if not math.isfinite(float(p_val)):
-            p_val = train_summary.get("patch_cos_sim", 0.85)
-        s_val = val_summary.get("salient_patch_cos", float("nan"))
-        if not math.isfinite(float(s_val)):
-            s_val = train_summary.get("salient_patch_cos", p_val)
-        g_val = val_summary.get("global_cos_sim", float("nan"))
-        if not math.isfinite(float(g_val)):
-            g_val = train_summary.get("global_cos_sim", 0.90)
-        composite_cos = (
-            0.55 * float(p_val)
-            + 0.30 * float(s_val)
-            + 0.15 * float(g_val)
-            - 0.0015 * float(val_summary.get("feature_reid_evasion_pct", 0.0))
-        )
-        if math.isfinite(composite_cos) and composite_cos < best_patch_cos:
-            best_patch_cos = composite_cos
+        if val_summary["patch_cos_sim"] < best_patch_cos:
+            best_patch_cos = val_summary["patch_cos_sim"]
             save_checkpoint(out_dir / "best_generator.pt", generator, ema, config, epoch, val_summary)
 
         if epoch % save_every == 0:
