@@ -17,10 +17,10 @@
   --color-text-light: #d1d1d6;
   --color-text-white: #ffffff;
   
-  --color-workspace-bg: #ececee;
-  --color-workspace-text: #242426;
-  --color-workspace-subtext: #6a6a70;
-  --color-workspace-emblem: #3e3e42;
+  --color-workspace-bg: #63636d;
+  --color-workspace-text: #ffffff;
+  --color-workspace-subtext: #e2e2e8;
+  --color-workspace-emblem: #ffffff;
 }
 
 *, *::before, *::after {

@@ -1,17 +1,74 @@
 import React from 'react';
 
-export const WindowHeader: React.FC = () => {
+export type AppView = 'image' | 'video' | 'benchmark';
+
+interface WindowHeaderProps {
+  currentView?: AppView;
+  onNavigate?: (view: AppView) => void;
+}
+
+export const WindowHeader: React.FC<WindowHeaderProps> = ({
+  currentView = 'image',
+  onNavigate,
+}) => {
   return (
     <header className="window-header" aria-label="Application title bar">
-      {/* Left side: Classic CONCEALED wordmark leading the top bar & PORTABLE tab */}
       <div className="topbar-left" role="presentation">
-        <span className="concealed-classic-title">CONCEALED</span>
-        <div className="portable-tab">
-          <span className="portable-text">PORTABLE</span>
-        </div>
+        {/* Classic CONCEALED wordmark on the far left */}
+        <button
+          type="button"
+          className="concealed-title-btn"
+          onClick={() => onNavigate?.('image')}
+          aria-label="Return to image workspace"
+          title="Return to image workspace"
+        >
+          <span className="concealed-classic-title">CONCEALED</span>
+        </button>
+
+        {/* Excel-style Sheet Tabs Navigation */}
+        <nav className="excel-tab-bar" role="tablist" aria-label="Worksheet pages">
+          <span className="excel-nav-arrow" aria-hidden="true">›</span>
+
+          {/* IMAGE Tab */}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={currentView === 'image'}
+            className={`excel-tab ${currentView === 'image' ? 'active' : ''}`}
+            onClick={() => onNavigate?.('image')}
+          >
+            <span className="excel-tab-label">IMAGE</span>
+          </button>
+
+          <span className="excel-tab-separator" aria-hidden="true" />
+
+          {/* VIDEO Tab */}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={currentView === 'video'}
+            className={`excel-tab ${currentView === 'video' ? 'active' : ''}`}
+            onClick={() => onNavigate?.('video')}
+          >
+            <span className="excel-tab-label">VIDEO</span>
+          </button>
+
+          <span className="excel-tab-separator" aria-hidden="true" />
+
+          {/* BENCHMARK Tab */}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={currentView === 'benchmark'}
+            className={`excel-tab ${currentView === 'benchmark' ? 'active' : ''}`}
+            onClick={() => onNavigate?.('benchmark')}
+          >
+            <span className="excel-tab-label">BENCHMARK</span>
+          </button>
+        </nav>
       </div>
 
-      {/* Right side has no window controls (X, minimize, maximize removed) */}
+      {/* Right side is kept clean */}
       <div className="topbar-right" aria-hidden="true" />
     </header>
   );

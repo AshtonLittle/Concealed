@@ -202,6 +202,7 @@ export const NoAISymbol: React.FC<{ size?: number; className?: string }> = ({ si
       height={size}
       viewBox="0 0 200 200"
       fill="none"
+      stroke="currentColor"
       className={className}
       aria-hidden="true"
     >
@@ -217,7 +218,7 @@ export const NoAISymbol: React.FC<{ size?: number; className?: string }> = ({ si
         cx="100"
         cy="100"
         r="91"
-        stroke="#424246"
+        stroke="currentColor"
         strokeWidth="9"
         fill="none"
       />
@@ -225,7 +226,7 @@ export const NoAISymbol: React.FC<{ size?: number; className?: string }> = ({ si
       {/* Nested Stylized AI / Neural Knot (OpenAI-style 6-fold looping knot) */}
       <g
         transform="translate(100, 100) scale(1.15) translate(-50, -50)"
-        stroke="#424246"
+        stroke="currentColor"
         strokeWidth="6.5"
         strokeLinecap="round"
         strokeLinejoin="round"
@@ -257,7 +258,7 @@ export const NoAISymbol: React.FC<{ size?: number; className?: string }> = ({ si
         <path d="M 84 48 L 61 48" />
 
         {/* Inner center core rings */}
-        <circle cx="50" cy="50" r="9" stroke="#424246" strokeWidth="5.5" />
+        <circle cx="50" cy="50" r="9" stroke="currentColor" strokeWidth="5.5" />
       </g>
 
       {/* The Diagonal Prohibition Strike-through Line */}
@@ -267,7 +268,7 @@ export const NoAISymbol: React.FC<{ size?: number; className?: string }> = ({ si
         y1="36"
         x2="164"
         y2="164"
-        stroke="#424246"
+        stroke="currentColor"
         strokeWidth="9"
         strokeLinecap="round"
       />
