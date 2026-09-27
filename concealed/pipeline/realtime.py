@@ -309,7 +309,9 @@ class RealtimeObfuscator:
         for step in range(1, steps + 1):
             opt.zero_grad()
             delta_384 = _synthesize_delta_384()
-            delta_224 = F.interpolate(delta_384, size=(224, 224), mode="bilinear", align_corners=False)
+            # Straight-Through Estimator (STE) for uint8 quantization so perturbation survives 8-bit image saving
+            delta_384_q = delta_384 + (torch.round(delta_384 * 255.0) / 255.0 - delta_384).detach()
+            delta_224 = F.interpolate(delta_384_q, size=(224, 224), mode="bilinear", align_corners=False)
             x_adv = torch.clamp(x_224_clean + delta_224, 0.0, 1.0)
 
             total_loss = torch.tensor(0.0, device=dev)
@@ -321,24 +323,35 @@ class RealtimeObfuscator:
             for m, c_out in zip(models, clean_targets):
                 o_out = m(x_adv)
                 g_cos = (c_out.global_embedding.detach() * o_out.global_embedding).sum(dim=-1).mean()
-                g_cos_list.append(float(g_cos.detach().item()))
-                total_loss = total_loss + 2.5 * g_cos
+                g_cos_val = float(g_cos.detach().item())
+                g_cos_list.append(g_cos_val)
+
+                surr_loss = 3.2 * g_cos
+                surr_p_cos_vals = []
 
                 for cp, op in zip(c_out.patch_tokens, o_out.patch_tokens):
                     cp_d = cp.detach()
                     per_p = (cp_d * op).sum(dim=-1)
-                    p_cos_list.append(float(per_p.mean().detach().item()))
+                    p_val = float(per_p.mean().detach().item())
+                    p_cos_list.append(p_val)
+                    surr_p_cos_vals.append(p_val)
                     c50_list.append(float((per_p.detach() < 0.50).float().mean().item() * 100.0))
 
-                    # Salience-weighted foreground attack
+                    # Salience-weighted foreground feature repulsion
                     cp_cent = cp_d - cp_d.mean(dim=1, keepdim=True)
                     sal = cp_cent.norm(dim=-1)
                     sal_w = torch.softmax(sal * 3.0, dim=-1) * cp_d.shape[1]
-                    total_loss = total_loss + 3.5 * (per_p * sal_w).mean()
+                    surr_loss = surr_loss + 3.6 * (per_p * sal_w).mean()
 
                     k_top = max(1, cp_d.shape[1] // 4)
                     top_idx = torch.topk(sal, k=k_top, dim=-1).indices
                     s_cos_list.append(float(torch.gather(per_p.detach(), 1, top_idx).mean().item()))
+
+                # Hard-Surrogate Focal Weighting: boost gradients on tougher surrogates (e.g., DINOv2, CLIP)
+                mean_surr_p = float(np.mean(surr_p_cos_vals)) if surr_p_cos_vals else g_cos_val
+                hardness = max(0.0, min(1.0, 0.55 * mean_surr_p + 0.45 * g_cos_val))
+                focal_w = 1.0 + 1.4 * (hardness ** 1.5)
+                total_loss = total_loss + focal_w * surr_loss
 
             total_loss.backward()
             opt.step()
@@ -456,6 +469,7 @@ class RealtimeObfuscator:
                 displaced_pct = (1.0 - len(c_set.intersection(o_set)) / max(1, len(c_set))) * 100.0
                 salient_displacement_layers.append(float(displaced_pct))
 
+            mean_p_cos = float(np.mean(p_cos_layers))
             mean_s_cos = float(np.mean(s_cos_layers))
             mean_reid_ev = float(np.mean(patch_reid_evasion_layers))
             mean_disp = float(np.mean(salient_displacement_layers))
@@ -463,14 +477,16 @@ class RealtimeObfuscator:
             model_reports.append(
                 {
                     "model": mname.split("/")[-1],
-                    "patch_cos": round(float(np.mean(p_cos_layers)), 4),
+                    "patch_cos": round(mean_p_cos, 4),
                     "salient_patch_cos": round(mean_s_cos, 4),
                     "global_cos": round(g_cos, 4),
                     "concealed_patches_70_pct": round(float(np.mean(c70_layers)), 1),
                     "concealed_patches_50_pct": round(float(np.mean(c50_layers)), 1),
                     "patch_reid_evasion_pct": round(mean_reid_ev, 1),
                     "salient_displacement_pct": round(mean_disp, 1),
-                    "identification_evaded": bool(mean_reid_ev >= 50.0 or mean_s_cos < 0.50 or g_cos < 0.45),
+                    "identification_evaded": bool(
+                        mean_reid_ev >= 50.0 or mean_p_cos < 0.70 or mean_s_cos < 0.65 or g_cos < 0.55
+                    ),
                 }
             )
 

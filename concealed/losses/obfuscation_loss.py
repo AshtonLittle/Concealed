@@ -198,21 +198,32 @@ class CompositeObfuscationLoss(nn.Module):
                     spatial_mean = F.normalize(obf_patches.mean(dim=1, keepdim=True), p=2, dim=-1)
                     uniform_sim = (obf_patches * spatial_mean).sum(dim=-1).mean()
 
-                    # Cross-patch Gram matrix [B, N, N] (subsampled if N > 256 for speed)
+                    # Cross-patch Gram matrix & Impostor Patch Contrastive Margin [B, N, N]
                     if cp.shape[1] <= 256:
+                        cp_sub = cp
+                        op_sub = obf_patches
                         cp_norm = F.normalize(cp_centered, p=2, dim=-1)
                         op_norm = F.normalize(obf_centered, p=2, dim=-1)
                     else:
                         stride = max(1, cp.shape[1] // 196)
+                        cp_sub = cp[:, ::stride]
+                        op_sub = obf_patches[:, ::stride]
                         cp_norm = F.normalize(cp_centered[:, ::stride], p=2, dim=-1)
                         op_norm = F.normalize(obf_centered[:, ::stride], p=2, dim=-1)
                     gram_clean = torch.bmm(cp_norm, cp_norm.transpose(1, 2))
                     gram_obf = torch.bmm(op_norm, op_norm.transpose(1, 2))
                     gram_align = (gram_clean * gram_obf).mean()
 
+                    # Pull each obfuscated patch toward its strongest off-diagonal clean impostor patch j != i
+                    sim_grid = torch.bmm(op_sub, cp_sub.transpose(1, 2))
+                    eye_mask = torch.eye(cp_sub.shape[1], device=cp.device, dtype=torch.bool).unsqueeze(0)
+                    off_diag = sim_grid.masked_fill(eye_mask, -1e4)
+                    impostor_sim = (torch.logsumexp(off_diag * 10.0, dim=-1) / 10.0).mean()
+
                     layer_disp_losses.append(
                         F.relu(cov_align - self.cosine_margin)
                         + 0.35 * F.relu(gram_align)
+                        + 0.45 * (1.0 - impostor_sim)
                         + (1.0 - uniform_sim) * 0.25
                     )
 

@@ -163,9 +163,12 @@ def merge_generator_checkpoints(
     scores: list[float] = []
     for c in ckpts:
         m = c.get("metrics", {})
-        p_cos = float(m.get("patch_cos_sim", 0.85))
-        s_cos = float(m.get("salient_patch_cos", p_cos))
-        sem_flip = float(m.get("semantic_neighbor_flip_pct", 0.0))
+        raw_p = float(m.get("patch_cos_sim", 0.80))
+        p_cos = raw_p if math.isfinite(raw_p) else 0.80
+        raw_s = float(m.get("salient_patch_cos", p_cos))
+        s_cos = raw_s if math.isfinite(raw_s) else p_cos
+        raw_flip = float(m.get("semantic_neighbor_flip_pct", 0.0))
+        sem_flip = raw_flip if math.isfinite(raw_flip) else 0.0
         score = (1.0 - p_cos) + 0.5 * (1.0 - s_cos) + 0.003 * sem_flip
         scores.append(score)
 
@@ -188,8 +191,10 @@ def merge_generator_checkpoints(
         for w, c in zip(weights, ckpts):
             sd = c.get("generator_state_dict", c)
             if k in sd and sd[k].shape == ref_tensor.shape:
-                worker_tensors.append(sd[k].to(device=device, dtype=torch.float32))
-                worker_weights.append(w)
+                t_cand = sd[k].to(device=device, dtype=torch.float32)
+                if torch.isfinite(t_cand).all():
+                    worker_tensors.append(t_cand)
+                    worker_weights.append(w)
 
         if not worker_tensors:
             merged_sd[k] = ref_tensor.clone()
@@ -211,15 +216,20 @@ def merge_generator_checkpoints(
     generator.load_state_dict(merged_sd, strict=False)
     generator.to(device).eval()
 
-    # Aggregate validation metrics weighted by worker weights
+    # Aggregate finite validation metrics weighted by worker weights
     merged_metrics: Dict[str, float] = {}
     all_metric_keys = set()
     for c in ckpts:
         all_metric_keys.update(c.get("metrics", {}).keys())
     for mk in sorted(all_metric_keys):
-        vals = [float(c.get("metrics", {}).get(mk, 0.0)) for c in ckpts if mk in c.get("metrics", {})]
-        if vals:
-            merged_metrics[mk] = round(float(sum(w * float(c.get("metrics", {}).get(mk, vals[0])) for w, c in zip(weights, ckpts))), 4)
+        finite_pairs = [
+            (w, float(c.get("metrics", {})[mk]))
+            for w, c in zip(weights, ckpts)
+            if mk in c.get("metrics", {}) and math.isfinite(float(c.get("metrics", {})[mk]))
+        ]
+        if finite_pairs:
+            w_tot = sum(w for w, _ in finite_pairs) or 1.0
+            merged_metrics[mk] = round(float(sum(w * val for w, val in finite_pairs) / w_tot), 4)
 
     merge_info = {
         "num_merged": len(valid_paths),
@@ -245,7 +255,6 @@ def merge_generator_checkpoints(
     return generator, merge_info
 
 
-
 @torch.no_grad()
 def validate(
     generator: AmortizedObfuscationGenerator,
@@ -258,8 +267,9 @@ def validate(
     """Run validation over val_loader and compute mean obfuscation, stealth, and feature identification metrics."""
     generator.eval()
     accum: Dict[str, float] = {}
-    count = 0
+    valid_counts: Dict[str, int] = {}
     use_amp = device.type == "cuda"
+    val_amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
     # Collect embeddings across the validation gallery to measure real Feature Identification & Semantic Flip rates
     clean_glob_gallery: Dict[str, list] = {}
@@ -269,20 +279,25 @@ def validate(
 
     for batch_idx, x_clean in enumerate(val_loader):
         x_clean = x_clean.to(device, non_blocking=True)
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type, dtype=val_amp_dtype, enabled=use_amp):
             x_obf, delta = generator(x_clean, return_delta=True)
             clean_outputs = surrogates(x_clean)
             obf_outputs = surrogates(x_obf)
-            _, metrics = loss_fn(x_clean, x_obf, delta, clean_outputs, obf_outputs)
+        # Compute loss & stealth metrics in float32 to prevent fp16 overflow on high-contrast batches
+        _, metrics = loss_fn(x_clean.float(), x_obf.float(), delta.float(), clean_outputs, obf_outputs)
 
         for c_out, o_out in zip(clean_outputs, obf_outputs):
             short_name = o_out.name.split("/")[-1]
-            clean_glob_gallery.setdefault(short_name, []).append(c_out.global_embedding.detach().float().cpu())
-            obf_glob_gallery.setdefault(short_name, []).append(o_out.global_embedding.detach().float().cpu())
+            c_g = torch.nan_to_num(c_out.global_embedding.detach().float(), nan=0.0)
+            o_g = torch.nan_to_num(o_out.global_embedding.detach().float(), nan=0.0)
+            clean_glob_gallery.setdefault(short_name, []).append(c_g.cpu())
+            obf_glob_gallery.setdefault(short_name, []).append(o_g.cpu())
             if c_out.patch_tokens and o_out.patch_tokens:
                 # Pool final tapped layer's patch tokens into a spatial-structural descriptor
-                cp_desc = torch.nn.functional.normalize(c_out.patch_tokens[-1].detach().float().mean(dim=1), p=2, dim=-1)
-                op_desc = torch.nn.functional.normalize(o_out.patch_tokens[-1].detach().float().mean(dim=1), p=2, dim=-1)
+                cp_raw = torch.nan_to_num(c_out.patch_tokens[-1].detach().float(), nan=0.0)
+                op_raw = torch.nan_to_num(o_out.patch_tokens[-1].detach().float(), nan=0.0)
+                cp_desc = torch.nn.functional.normalize(cp_raw.mean(dim=1), p=2, dim=-1)
+                op_desc = torch.nn.functional.normalize(op_raw.mean(dim=1), p=2, dim=-1)
                 clean_patch_gallery.setdefault(short_name, []).append(cp_desc.cpu())
                 obf_patch_gallery.setdefault(short_name, []).append(op_desc.cpu())
 
@@ -290,16 +305,18 @@ def validate(
         mse = torch.mean((x_clean.float() - x_obf.float()) ** 2).item()
         psnr = 10.0 * math.log10(1.0 / max(mse, 1e-10))
         metrics["psnr_db"] = psnr
-        metrics["linf_255"] = float(torch.max(torch.abs(delta)).item() * 255.0)
+        metrics["linf_255"] = float(torch.max(torch.abs(delta.float())).item() * 255.0)
 
         for k, v in metrics.items():
-            accum[k] = accum.get(k, 0.0) + v
-        count += 1
+            fv = float(v)
+            if math.isfinite(fv):
+                accum[k] = accum.get(k, 0.0) + fv
+                valid_counts[k] = valid_counts.get(k, 0) + 1
 
         if batch_idx == 0 and sample_out_path is not None:
             save_visual_comparison(x_clean.float(), x_obf.float(), delta.float(), sample_out_path)
 
-    summary = {k: v / max(count, 1) for k, v in accum.items()}
+    summary = {k: v / max(valid_counts.get(k, 1), 1) for k, v in accum.items()}
 
     # Compute Gallery Feature Identification Evasion (%) and Semantic Neighbor Flip Rate (%) per Vision Transformer
     reid_evasion_list = []
@@ -635,15 +652,24 @@ def train(
             )
         print("+---------------------------------------------------------------------------------------+\n", flush=True)
 
-        # Save latest & best checkpoints (using composite evasion quality score)
+        # Save latest & best checkpoints (using composite evasion quality score, falling back to train if val had NaN)
         save_checkpoint(out_dir / "latest_generator.pt", generator, ema, config, epoch, val_summary)
+        p_val = val_summary.get("patch_cos_sim", float("nan"))
+        if not math.isfinite(float(p_val)):
+            p_val = train_summary.get("patch_cos_sim", 0.85)
+        s_val = val_summary.get("salient_patch_cos", float("nan"))
+        if not math.isfinite(float(s_val)):
+            s_val = train_summary.get("salient_patch_cos", p_val)
+        g_val = val_summary.get("global_cos_sim", float("nan"))
+        if not math.isfinite(float(g_val)):
+            g_val = train_summary.get("global_cos_sim", 0.90)
         composite_cos = (
-            0.55 * val_summary["patch_cos_sim"]
-            + 0.30 * val_summary.get("salient_patch_cos", val_summary["patch_cos_sim"])
-            + 0.15 * val_summary["global_cos_sim"]
-            - 0.0015 * val_summary.get("feature_reid_evasion_pct", 0.0)
+            0.55 * float(p_val)
+            + 0.30 * float(s_val)
+            + 0.15 * float(g_val)
+            - 0.0015 * float(val_summary.get("feature_reid_evasion_pct", 0.0))
         )
-        if composite_cos < best_patch_cos:
+        if math.isfinite(composite_cos) and composite_cos < best_patch_cos:
             best_patch_cos = composite_cos
             save_checkpoint(out_dir / "best_generator.pt", generator, ema, config, epoch, val_summary)
 
