@@ -441,8 +441,10 @@ def train(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    mp_mode = str(train_cfg.get("mixed_precision", "fp16")).lower()
+    mp_mode = str(train_cfg.get("mixed_precision", "bf16")).lower()
     use_amp = device.type == "cuda" and mp_mode in ("fp16", "bf16")
+    if use_amp and mp_mode == "fp16" and torch.cuda.is_bf16_supported():
+        mp_mode = "bf16"
     amp_dtype = torch.bfloat16 if mp_mode == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and mp_mode == "fp16"))
 
@@ -534,12 +536,15 @@ def train(
 
             if (idx + 1) % grad_accum == 0 or (idx + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    ema.update(generator)
+                else:
+                    scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-                ema.update(generator)
 
             for k, v in metrics.items():
                 epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v
