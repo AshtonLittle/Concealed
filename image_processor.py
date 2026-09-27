@@ -225,6 +225,114 @@ def process_image(
     return saved_path
 
 
+def process_image_bytes(
+    image_bytes: bytes,
+    features: list[str] | str | None = None,
+    conf: float = 0.25,
+    show_boxes: bool = False,
+    show_contours: bool = False,
+    output_format: str = "PNG",
+) -> tuple[bytes, str, list[dict]]:
+    """
+    In-memory image processing pipeline:
+    1. Writes input image bytes to a temporary file.
+    2. Runs detection and applies algorithm conforming strictly to object silhouettes.
+    3. Encodes modified image to bytes in the requested format.
+    4. Returns (output_bytes, mime_type, detected_regions_info).
+    """
+    import io
+    import tempfile
+    import os
+
+    if isinstance(features, str):
+        features = [f.strip() for f in features.split(",") if f.strip()]
+
+    # Write to a temp file for detector functions
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_in:
+        tmp_in.write(image_bytes)
+        tmp_in_path = Path(tmp_in.name)
+
+    try:
+        image_obj = load_image(tmp_in_path)
+        if image_obj.mode not in ("RGB", "RGBA"):
+            image_obj = image_obj.convert("RGB")
+
+        canvas = image_obj.copy()
+        regions_info: list[dict] = []
+
+        if not features:
+            canvas = apply_algorithm(canvas)
+        else:
+            all_regions: list[ConformingRegion] = []
+            for feat in features:
+                feat_name = feat.strip()
+                regions = detect_feature_regions(tmp_in_path, feat_name, conf=conf)
+                all_regions.extend(regions)
+
+            for idx, region in enumerate(all_regions, 1):
+                x1 = max(0, min(image_obj.width - 1, region.x1))
+                y1 = max(0, min(image_obj.height - 1, region.y1))
+                x2 = max(x1 + 1, min(image_obj.width, region.x2))
+                y2 = max(y1 + 1, min(image_obj.height, region.y2))
+
+                section = canvas.crop((x1, y1, x2, y2))
+                mask_pil = region.pil_mask
+                if mask_pil.size != section.size:
+                    mask_pil = mask_pil.resize(section.size, Image.Resampling.NEAREST)
+                smoothed_mask = mask_pil.filter(ImageFilter.GaussianBlur(radius=1.0))
+
+                try:
+                    modified_section = apply_algorithm(section, mask=smoothed_mask)
+                except TypeError:
+                    modified_section = apply_algorithm(section)
+
+                if modified_section.size != section.size:
+                    modified_section = modified_section.resize(section.size)
+
+                canvas.paste(modified_section, (x1, y1), mask=smoothed_mask)
+
+                fg_count = int(np.count_nonzero(region.mask))
+                total_count = max(1, region.mask.size)
+                coverage = (fg_count / total_count) * 100
+                regions_info.append({
+                    "id": idx,
+                    "label": region.label,
+                    "confidence": round(float(region.confidence), 4),
+                    "bbox": [x1, y1, x2, y2],
+                    "mask_coverage_pct": round(coverage, 2),
+                })
+
+            if show_contours:
+                for region in all_regions:
+                    draw_conforming_contours(canvas, region, color=(0, 255, 128))
+            elif show_boxes:
+                draw = ImageDraw.Draw(canvas)
+                for region in all_regions:
+                    draw.rectangle([region.x1, region.y1, region.x2, region.y2], outline="red", width=2)
+                    draw.text((region.x1 + 4, max(0, region.y1 - 15)), region.label, fill="red")
+
+        # Encode canvas to bytes
+        fmt = output_format.upper()
+        if fmt not in ["PNG", "JPEG", "JPG", "WEBP"]:
+            fmt = "PNG"
+        save_fmt = "JPEG" if fmt in ["JPEG", "JPG"] else fmt
+        mime = f"image/{save_fmt.lower()}"
+
+        buf = io.BytesIO()
+        if save_fmt == "JPEG" and canvas.mode == "RGBA":
+            canvas = canvas.convert("RGB")
+        canvas.save(buf, format=save_fmt)
+        out_bytes = buf.getvalue()
+
+        return out_bytes, mime, regions_info
+    finally:
+        try:
+            if tmp_in_path.exists():
+                os.remove(tmp_in_path)
+        except Exception:
+            pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Constructs the command-line argument parser."""
     parser = argparse.ArgumentParser(

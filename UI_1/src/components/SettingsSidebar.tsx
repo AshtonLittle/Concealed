@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
+import type { AppView } from './WindowHeader';
 
 interface SettingsSidebarProps {
   isOpen?: boolean;
   onToggle?: () => void;
-  currentView?: 'image' | 'video';
+  currentView?: AppView;
 }
 
 export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
