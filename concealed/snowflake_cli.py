@@ -858,6 +858,23 @@ def main() -> None:
 
                 shutil.copy2(candidate, init_ckpt_path)
             print(f"[Prep] Warm-starting all {num_workers} account(s) from {candidate} (saved base snapshot -> {init_ckpt_path.name})")
+    else:
+        existing_best = out_dir / "best_generator.pt"
+        if existing_best.exists():
+            import shutil
+
+            backup_pt = out_dir / "poc_backup_generator.pt"
+            shutil.copy2(existing_best, backup_pt)
+            print(f"[Prep] Backed up previous checkpoint {existing_best.name} -> {backup_pt.name}")
+        # Create a single shared random initialization theta_0 so all fleet GPUs share the same channel basis
+        from concealed.models.generator import build_generator
+        from concealed.train import save_checkpoint, set_seed
+
+        set_seed(int(base_config.get("training", {}).get("seed", 42)))
+        fresh_gen = build_generator(base_config)
+        init_ckpt_path = out_dir / "init_base_generator.pt"
+        save_checkpoint(init_ckpt_path, fresh_gen, None, base_config, epoch=0, metrics={})
+        print(f"[Prep] Created fresh shared initialization ({init_ckpt_path.name}) for --from-scratch across {num_workers} GPU(s).")
 
     # Pre-build the shared surrogate tar archive once locally before parallel account provisioning
     profile_tag = args.profile or "custom"

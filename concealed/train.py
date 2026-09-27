@@ -360,8 +360,8 @@ def train(
     seed = int(train_cfg.get("seed", 42))
     num_shards = max(1, int(train_cfg.get("num_shards", 1)))
     shard_id = int(train_cfg.get("shard_id", 0))
-    # Vary augmentation / batch ordering RNG per shard while keeping validation split seed fixed
-    set_seed(seed + shard_id * 101)
+    # Initialize with shared base seed first so all fleet workers share the exact same initial weight basin theta_0
+    set_seed(seed)
 
     if device_str:
         device = torch.device(device_str)
@@ -406,6 +406,9 @@ def train(
         }
         generator.load_state_dict(filtered_sd, strict=False)
         print(f"  [Warm-Start] Initialized generator weights from {ckpt_to_load}", flush=True)
+
+    # Vary augmentation / EOT / batch ordering RNG per shard after generator initialization
+    set_seed(seed + shard_id * 101)
 
     ema = ModelEMA(generator, decay=float(train_cfg.get("ema_decay", 0.995)))
 
