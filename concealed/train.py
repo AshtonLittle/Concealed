@@ -177,6 +177,38 @@ def merge_generator_checkpoints(
         base_raw = torch.load(base_checkpoint, map_location=device, weights_only=False)
         base_sd = base_raw.get("generator_state_dict", base_raw)
 
+    # If merging --from-scratch models without a shared warm-start base_checkpoint, pick the strongest worker
+    # to avoid hidden-channel permutation cancellation across independent random-init trajectories.
+    if base_sd is None:
+        best_idx = int(torch.argmax(score_tensor).item())
+        best_ckpt = ckpts[best_idx]
+        best_sd = best_ckpt.get("generator_state_dict", best_ckpt)
+        filtered_best = {k: v for k, v in best_sd.items() if k in target_sd and target_sd[k].shape == v.shape}
+        generator.load_state_dict(filtered_best, strict=False)
+        generator.to(device).eval()
+        best_metrics = best_ckpt.get("metrics", {})
+        merge_info = {
+            "num_merged": len(valid_paths),
+            "strategy": f"best_of_fleet (selected worker #{best_idx + 1}: {valid_paths[best_idx].parent.name})",
+            "weights": [1.0 if i == best_idx else 0.0 for i in range(len(valid_paths))],
+            "sources": [str(p) for p in valid_paths],
+            "task_vector_scaling": 1.0,
+            "metrics": best_metrics,
+        }
+        if output_path is not None:
+            out_p = Path(output_path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "generator_state_dict": generator.state_dict(),
+                "raw_generator_state_dict": generator.state_dict(),
+                "config": base_cfg,
+                "epoch": int(best_ckpt.get("epoch", 0)),
+                "metrics": best_metrics,
+                "merge_info": merge_info,
+            }
+            torch.save(payload, out_p)
+        return generator, merge_info
+
     merged_sd: Dict[str, torch.Tensor] = {}
     for k, ref_tensor in target_sd.items():
         if not ref_tensor.is_floating_point():
@@ -223,6 +255,7 @@ def merge_generator_checkpoints(
 
     merge_info = {
         "num_merged": len(valid_paths),
+        "strategy": "task_vector_soup",
         "weights": [round(w, 4) for w in weights],
         "sources": [str(p) for p in valid_paths],
         "task_vector_scaling": float(task_vector_scaling) if base_sd is not None else 1.0,
@@ -266,6 +299,7 @@ def validate(
     obf_glob_gallery: Dict[str, list] = {}
     clean_patch_gallery: Dict[str, list] = {}
     obf_patch_gallery: Dict[str, list] = {}
+    spatial_patch_evasion_accum: Dict[str, list[float]] = {}
 
     for batch_idx, x_clean in enumerate(val_loader):
         x_clean = x_clean.to(device, non_blocking=True)
@@ -280,11 +314,23 @@ def validate(
             clean_glob_gallery.setdefault(short_name, []).append(c_out.global_embedding.detach().float().cpu())
             obf_glob_gallery.setdefault(short_name, []).append(o_out.global_embedding.detach().float().cpu())
             if c_out.patch_tokens and o_out.patch_tokens:
+                cp_last = c_out.patch_tokens[-1].detach().float()
+                op_last = o_out.patch_tokens[-1].detach().float()
                 # Pool final tapped layer's patch tokens into a spatial-structural descriptor
-                cp_desc = torch.nn.functional.normalize(c_out.patch_tokens[-1].detach().float().mean(dim=1), p=2, dim=-1)
-                op_desc = torch.nn.functional.normalize(o_out.patch_tokens[-1].detach().float().mean(dim=1), p=2, dim=-1)
+                cp_desc = torch.nn.functional.normalize(cp_last.mean(dim=1), p=2, dim=-1)
+                op_desc = torch.nn.functional.normalize(op_last.mean(dim=1), p=2, dim=-1)
                 clean_patch_gallery.setdefault(short_name, []).append(cp_desc.cpu())
                 obf_patch_gallery.setdefault(short_name, []).append(op_desc.cpu())
+
+                # Spatial Patch Feature Re-ID Evasion (% of 196 local patches misidentified in the 14x14 spatial grid)
+                per_p_sim = (cp_last * op_last).sum(dim=-1)  # [B, N]
+                sim_grid = torch.bmm(op_last, cp_last.transpose(1, 2))  # [B, N, N]
+                matched_idx = torch.argmax(sim_grid, dim=-1)  # [B, N]
+                true_idx = torch.arange(cp_last.shape[1], device=cp_last.device).unsqueeze(0)
+                evaded_patches = (matched_idx != true_idx) | (per_p_sim < 0.50)
+                spatial_patch_evasion_accum.setdefault(short_name, []).append(
+                    float(evaded_patches.float().mean().item() * 100.0)
+                )
 
         # Compute PSNR in dB
         mse = torch.mean((x_clean.float() - x_obf.float()) ** 2).item()
@@ -301,7 +347,7 @@ def validate(
 
     summary = {k: v / max(count, 1) for k, v in accum.items()}
 
-    # Compute Gallery Feature Identification Evasion (%) and Semantic Neighbor Flip Rate (%) per Vision Transformer
+    # Compute Spatial Patch Feature Re-ID Evasion (%) and Gallery Semantic Neighbor Flip Rate (%) per Vision Transformer
     reid_evasion_list = []
     sem_flip_list = []
     for short_name, c_list in clean_glob_gallery.items():
@@ -321,9 +367,11 @@ def validate(
         top1_match = torch.argmax(sim_obf_to_clean, dim=-1)
         arange_idx = torch.arange(n_gal)
 
-        # Feature Identification Evaded if Top-1 match flips to a different image OR self-similarity drops < 0.65
-        evaded = (top1_match != arange_idx) | (diag_sim < 0.65)
-        evasion_pct = float(evaded.float().mean().item() * 100.0)
+        # Combine gallery-level Re-ID flip with spatial patch Re-ID evasion
+        gal_evaded = float(((top1_match != arange_idx) | (diag_sim < 0.65)).float().mean().item() * 100.0)
+        patch_ev_list = spatial_patch_evasion_accum.get(short_name, [])
+        patch_evaded = float(sum(patch_ev_list) / max(1, len(patch_ev_list))) if patch_ev_list else 0.0
+        evasion_pct = max(gal_evaded, patch_evaded)
         summary[f"reid_evasion_pct/{short_name}"] = evasion_pct
         reid_evasion_list.append(evasion_pct)
 
@@ -360,8 +408,8 @@ def train(
     seed = int(train_cfg.get("seed", 42))
     num_shards = max(1, int(train_cfg.get("num_shards", 1)))
     shard_id = int(train_cfg.get("shard_id", 0))
-    # Vary augmentation / batch ordering RNG per shard while keeping validation split seed fixed
-    set_seed(seed + shard_id * 101)
+    # Initialize generator with shared base seed first so all fleet workers start from identical weights
+    set_seed(seed)
 
     if device_str:
         device = torch.device(device_str)
@@ -383,6 +431,10 @@ def train(
     if max_images is not None:
         max_images = int(max_images)
 
+    generator = build_generator(config).to(device)
+    # Offset RNG per shard after generator init so data shuffling and EOT augmentations vary across shards
+    set_seed(seed + shard_id * 101)
+
     train_loader, val_loader = create_train_val_dataloaders(
         data_dir=data_dir,
         resolution=resolution,
@@ -394,8 +446,6 @@ def train(
         num_shards=num_shards,
         shard_id=shard_id,
     )
-
-    generator = build_generator(config).to(device)
     ckpt_to_load = init_checkpoint or train_cfg.get("init_checkpoint")
     if ckpt_to_load and Path(ckpt_to_load).exists():
         ckpt_data = torch.load(ckpt_to_load, map_location=device, weights_only=False)
