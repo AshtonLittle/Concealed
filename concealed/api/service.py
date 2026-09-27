@@ -651,6 +651,7 @@ class ObfuscationService:
 
         # Calculate analytics
         psnr_db, ssim_val, linf_val, rmse_val, chroma_rms_val = _compute_psnr_and_ssim(clean_rgb, obf_rgb)
+        quality_loss_pct = round(max(0.0, (1.0 - ssim_val) * 100.0), 2)
 
         analytics = ObfuscationAnalytics(
             psnr_db=psnr_db,
@@ -662,6 +663,7 @@ class ObfuscationService:
             original_resolution=(orig_w, orig_h),
             output_resolution=(orig_w, orig_h),
             output_bytes=len(out_bytes),
+            quality_loss_pct=quality_loss_pct,
         )
 
         return out_bytes, mime_type, analytics

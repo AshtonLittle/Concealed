@@ -40,6 +40,8 @@ app.add_middleware(
         "X-Regions-Found",
         "X-Frames-Processed",
         "X-FPS",
+        "X-Model",
+        "X-Quality-Loss-Pct",
     ],
 )
 

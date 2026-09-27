@@ -77,7 +77,7 @@ def apply_algorithm(section: Image.Image, mask: Image.Image | None = None) -> Im
     
     # Demonstration effect (Pixelation / Conceal):
     # This provides immediate visual feedback conforming to the object silhouette.
-    factor = 10
+    factor = 25
     w_small = max(1, section.width // factor)
     h_small = max(1, section.height // factor)
     small = section.resize((w_small, h_small), resample=Image.Resampling.BILINEAR)

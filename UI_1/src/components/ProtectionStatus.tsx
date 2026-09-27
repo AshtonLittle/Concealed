@@ -1,11 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
+import type { ConcealStats } from './Sidebar';
 
 interface ProtectionStatusProps {
   selectedModelEngine?: 'onnx' | 'pt';
+  onStatsUpdate?: (stats: ConcealStats | null) => void;
 }
 
 export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
   selectedModelEngine = 'onnx',
+  onStatsUpdate,
 }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -14,6 +17,7 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
   const [concealedImageUrl, setConcealedImageUrl] = useState<string | null>(null);
   const [activeDisplayMode, setActiveDisplayMode] = useState<'concealed' | 'original'>('concealed');
   const [telemetry, setTelemetry] = useState<{
+    model: string;
     psnr: number;
     ssim: number;
     linf: number;
@@ -30,13 +34,15 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
       setConcealedImageUrl(null);
       setTelemetry(null);
       setErrorMsg(null);
+      onStatsUpdate?.(null);
       return () => URL.revokeObjectURL(url);
     } else {
       setPreviewUrl(null);
       setConcealedImageUrl(null);
       setTelemetry(null);
+      onStatsUpdate?.(null);
     }
-  }, [selectedFile]);
+  }, [selectedFile, onStatsUpdate]);
 
   useEffect(() => {
     return () => {
@@ -80,6 +86,7 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
     setConcealedImageUrl(null);
     setTelemetry(null);
     setErrorMsg(null);
+    onStatsUpdate?.(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -128,12 +135,26 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
       const ssim = parseFloat(res.headers.get('X-SSIM') || '0');
       const linf = parseFloat(res.headers.get('X-Linf-255') || '8.0');
       const timeMs = parseFloat(res.headers.get('X-Processing-Time-Ms') || '0');
+      const rawLoss = parseFloat(res.headers.get('X-Quality-Loss-Pct') || '');
+      const qualityLossPct = Number.isFinite(rawLoss)
+        ? rawLoss
+        : (Number.isFinite(ssim) && ssim > 0 ? Math.max(0, (1 - ssim) * 100) : 0);
+
+      const model = res.headers.get('X-Model') || 'best_generator.pt';
 
       setTelemetry({
+        model,
         psnr: Number.isFinite(psnr) ? psnr : 42.0,
         ssim: Number.isFinite(ssim) ? ssim : 0.98,
         linf: Number.isFinite(linf) ? linf : 8.0,
         timeMs: Number.isFinite(timeMs) ? timeMs : 0,
+      });
+
+      onStatsUpdate?.({
+        latencyMs: Number.isFinite(timeMs) ? timeMs : null,
+        qualityLossPct: Number.isFinite(qualityLossPct) ? qualityLossPct : null,
+        psnrDb: Number.isFinite(psnr) ? psnr : null,
+        ssim: Number.isFinite(ssim) ? ssim : null,
       });
     } catch (err: unknown) {
       console.error('Image concealing failed:', err);
@@ -338,7 +359,7 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
               <div className="telemetry-badge">
                 <span className="badge-k">ENGINE</span>
                 <span className="badge-v highlight">
-                  {selectedModelEngine === 'onnx' ? 'generator.onnx' : 'best_generator.pt'}
+                  {selectedModelEngine === 'onnx' ? 'generator.onnx' : (telemetry.model || 'best_generator.pt')}
                 </span>
               </div>
               <div className="telemetry-badge">
@@ -348,6 +369,10 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
               <div className="telemetry-badge">
                 <span className="badge-k">SSIM</span>
                 <span className="badge-v">{telemetry.ssim.toFixed(4)}</span>
+              </div>
+              <div className="telemetry-badge">
+                <span className="badge-k">QUALITY LOSS</span>
+                <span className="badge-v">{((1.0 - telemetry.ssim) * 100).toFixed(1)}%</span>
               </div>
               <div className="telemetry-badge">
                 <span className="badge-k">L_INF</span>

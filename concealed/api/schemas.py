@@ -133,6 +133,7 @@ class ObfuscationAnalytics(BaseModel):
     original_resolution: Tuple[int, int] = Field(..., description="(Width, Height) of original input.")
     output_resolution: Tuple[int, int] = Field(..., description="(Width, Height) of obfuscated output.")
     output_bytes: int = Field(..., description="Size of generated image in bytes.")
+    quality_loss_pct: float = Field(default=0.0, description="Measured visual quality loss percentage vs clean image (100 * (1 - SSIM)).")
 
 
 class ObfuscationJSONResponse(BaseModel):

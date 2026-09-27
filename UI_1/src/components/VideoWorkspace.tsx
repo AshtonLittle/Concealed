@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import type { ConcealStats } from './Sidebar';
 
 export interface FrameItem {
   frame_index: number;
@@ -37,12 +38,12 @@ export interface VideoAnalytics {
 
 export type VideoTab = 'concealed' | 'original' | 'side-by-side';
 
-interface VideoWorkspaceProps {
+export interface VideoWorkspaceProps {
   onProcessingStart?: () => void;
+  onStatsUpdate?: (stats: ConcealStats | null) => void;
 }
 
-export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStart }) => {
-  // Input Video Selection States
+export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStart, onStatsUpdate }) => {
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -309,6 +310,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
     setMetadata(null);
     setAnalytics(null);
     setErrorMsg(null);
+    onStatsUpdate?.(null);
     setIsProcessing(false);
     if (videoInputRef.current) {
       videoInputRef.current.value = '';
