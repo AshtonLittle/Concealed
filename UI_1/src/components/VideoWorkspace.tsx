@@ -1,6 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
+import type { ConcealStats } from './Sidebar';
 
-export const VideoWorkspace: React.FC = () => {
+interface VideoWorkspaceProps {
+  onStatsUpdate?: (stats: ConcealStats | null) => void;
+}
+
+export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onStatsUpdate }) => {
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [concealedVideoUrl, setConcealedVideoUrl] = useState<string | null>(null);
@@ -75,6 +80,7 @@ export const VideoWorkspace: React.FC = () => {
     }
     setTelemetry(null);
     setErrorMsg(null);
+    onStatsUpdate?.(null);
     if (videoInputRef.current) {
       videoInputRef.current.value = '';
     }
@@ -121,6 +127,11 @@ export const VideoWorkspace: React.FC = () => {
         frames: frames > 0 ? frames : 1,
         fps: fps > 0 ? fps : 24,
         timeMs: timeMs > 0 ? timeMs : 0,
+      });
+
+      onStatsUpdate?.({
+        latencyMs: timeMs > 0 ? timeMs : null,
+        qualityLossPct: null,
       });
     } catch (err: unknown) {
       console.error('Video concealing failed:', err);

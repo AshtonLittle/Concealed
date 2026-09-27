@@ -1,16 +1,24 @@
 import React from 'react';
 import type { AppView } from './WindowHeader';
 
+export interface ConcealStats {
+  latencyMs?: number | null;
+  qualityLossPct?: number | null;
+  psnrDb?: number | null;
+  ssim?: number | null;
+}
+
 interface SidebarProps {
   isOpen?: boolean;
   onToggle?: () => void;
   currentView?: AppView;
+  stats?: ConcealStats | null;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
   isOpen = true,
   onToggle,
-  currentView = 'image',
+  stats,
 }) => {
   return (
     <aside
@@ -49,42 +57,42 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       <div className="branding-divider" role="separator" aria-hidden="true" />
 
-      {/* The 4 Core Clean Metrics - Zero Fluff */}
+      {/* Live Measurement Cards: Total Quality Loss & Latency */}
       <div className="sidebar-statistics-cards">
-        {/* Metric 1: AI Privacy Shield */}
-        <div className="statistic-card">
-          <span className="statistic-card-label">AI PRIVACY SHIELD</span>
-          <div className="statistic-metric-value">
-            <span className="metric-number">99.4</span>
-            <span className="metric-unit">%</span>
-          </div>
-        </div>
-
-        {/* Metric 2: Total Quality Loss */}
+        {/* Metric 1: Total Quality Loss (Normal vs Concealed) */}
         <div className="statistic-card">
           <span className="statistic-card-label">TOTAL QUALITY LOSS</span>
           <div className="statistic-metric-value">
-            <span className="metric-number">1.8</span>
+            <span className="metric-number">
+              {stats && stats.qualityLossPct !== undefined && stats.qualityLossPct !== null
+                ? stats.qualityLossPct.toFixed(1)
+                : '--'}
+            </span>
             <span className="metric-unit">%</span>
           </div>
+          <span className="statistic-card-sublabel">
+            {stats && stats.qualityLossPct !== undefined && stats.qualityLossPct !== null
+              ? `Degradation vs. clean image${stats.ssim ? ` (SSIM: ${stats.ssim.toFixed(3)})` : ''}`
+              : 'Conceal image to measure quality loss'}
+          </span>
         </div>
 
-        {/* Metric 3: Human Visual Quality */}
-        <div className="statistic-card">
-          <span className="statistic-card-label">HUMAN VISUAL QUALITY</span>
-          <div className="statistic-metric-value">
-            <span className="metric-number">4.9</span>
-            <span className="metric-unit denominator">/ 5.0</span>
-          </div>
-        </div>
-
-        {/* Metric 4: Latency */}
+        {/* Metric 2: Live Conceal Latency */}
         <div className="statistic-card">
           <span className="statistic-card-label">LATENCY</span>
           <div className="statistic-metric-value">
-            <span className="metric-number">{currentView === 'video' ? '33' : '138'}</span>
+            <span className="metric-number">
+              {stats && stats.latencyMs !== undefined && stats.latencyMs !== null
+                ? stats.latencyMs.toFixed(0)
+                : '--'}
+            </span>
             <span className="metric-unit">ms</span>
           </div>
+          <span className="statistic-card-sublabel">
+            {stats && stats.latencyMs !== undefined && stats.latencyMs !== null
+              ? 'Synthesis wall-clock time'
+              : 'Conceal image to measure latency'}
+          </span>
         </div>
       </div>
     </aside>

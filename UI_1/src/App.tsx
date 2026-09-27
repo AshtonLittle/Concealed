@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { WindowFrame } from './components/WindowFrame';
 import { Sidebar } from './components/Sidebar';
+import type { ConcealStats } from './components/Sidebar';
 import { SettingsSidebar } from './components/SettingsSidebar';
 import { MainWorkspace } from './components/MainWorkspace';
 import { VideoWorkspace } from './components/VideoWorkspace';
@@ -12,6 +13,9 @@ export function App() {
   const [currentView, setCurrentView] = useState<AppView>('image');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState(true);
+  const [concealStats, setConcealStats] = useState<ConcealStats | null>(null);
+
+  const isFeatureObscuring = currentView === 'feature-obscuring';
 
   return (
     <WindowFrame
@@ -22,24 +26,29 @@ export function App() {
       isSettingsOpen={isSettingsOpen}
       onToggleSettings={() => setIsSettingsOpen((prev) => !prev)}
     >
-      {/* Left Column: Statistics */}
-      <Sidebar
-        isOpen={isSidebarOpen}
-        onToggle={() => setIsSidebarOpen((prev) => !prev)}
-        currentView={currentView}
-      />
+      {/* Left Column: Statistics (hidden for feature obscuring) */}
+      {!isFeatureObscuring && (
+        <Sidebar
+          isOpen={isSidebarOpen}
+          onToggle={() => setIsSidebarOpen((prev) => !prev)}
+          currentView={currentView}
+          stats={concealStats}
+        />
+      )}
 
       {/* Middle Column: Centered Workspace */}
-      {currentView === 'image' && <MainWorkspace />}
+      {currentView === 'image' && <MainWorkspace onStatsUpdate={setConcealStats} />}
       {currentView === 'feature-obscuring' && <FeatureObscuringWorkspace />}
-      {currentView === 'video' && <VideoWorkspace />}
+      {currentView === 'video' && <VideoWorkspace onStatsUpdate={setConcealStats} />}
 
-      {/* Right Column: Settings (Mirrors Left Column) */}
-      <SettingsSidebar
-        isOpen={isSettingsOpen}
-        onToggle={() => setIsSettingsOpen((prev) => !prev)}
-        currentView={currentView}
-      />
+      {/* Right Column: Settings (hidden for feature obscuring) */}
+      {!isFeatureObscuring && (
+        <SettingsSidebar
+          isOpen={isSettingsOpen}
+          onToggle={() => setIsSettingsOpen((prev) => !prev)}
+          currentView={currentView}
+        />
+      )}
     </WindowFrame>
   );
 }

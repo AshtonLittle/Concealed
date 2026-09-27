@@ -251,10 +251,13 @@ class ObfuscationService:
         self.backend_name = "Algorithmic-DCT-Engine"
         self.model_path = None
 
-        # Auto-discover latest_generator.pt if not explicitly provided
+        # Auto-discover best_generator.pt (or latest_generator.pt) if not explicitly provided
         if checkpoint_path is None:
             candidates = [
                 os.environ.get("CONCEALED_CHECKPOINT"),
+                "best_generator.pt",
+                os.path.join(os.getcwd(), "best_generator.pt"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "best_generator.pt"),
                 "latest_generator.pt",
                 os.path.join(os.getcwd(), "latest_generator.pt"),
                 os.path.join(os.path.dirname(__file__), "..", "..", "latest_generator.pt"),
@@ -271,7 +274,8 @@ class ObfuscationService:
                 from concealed.pipeline.realtime import RealtimeObfuscator
                 self.torch_engine = RealtimeObfuscator(checkpoint_path, device=self.device_str)
                 self.model_path = checkpoint_path
-                self.backend_name = f"PyTorch-NeuralGenerator ({os.path.basename(checkpoint_path)})"
+                self.model_filename = os.path.basename(checkpoint_path)
+                self.backend_name = f"PyTorch-NeuralGenerator ({self.model_filename})"
                 print(f"[ObfuscationService] Loaded neural generator from '{checkpoint_path}' on {self.device_str}")
             except Exception as e:
                 print(f"[ObfuscationService] Note: Could not load checkpoint ({e}), running algorithmic engine.")
@@ -462,6 +466,7 @@ class ObfuscationService:
 
         # Calculate analytics
         psnr_db, ssim_val, linf_val, rmse_val, chroma_rms_val = _compute_psnr_and_ssim(clean_rgb, obf_rgb)
+        quality_loss_pct = round(max(0.0, (1.0 - ssim_val) * 100.0), 2)
 
         analytics = ObfuscationAnalytics(
             psnr_db=psnr_db,
@@ -473,6 +478,7 @@ class ObfuscationService:
             original_resolution=(orig_w, orig_h),
             output_resolution=(orig_w, orig_h),
             output_bytes=len(out_bytes),
+            quality_loss_pct=quality_loss_pct,
         )
 
         return out_bytes, mime_type, analytics

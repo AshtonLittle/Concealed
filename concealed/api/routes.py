@@ -229,6 +229,8 @@ async def obfuscate_image_upload(
             "X-SSIM": str(analytics.ssim),
             "X-Linf-255": str(analytics.linf_255),
             "X-Output-Format": ext.upper(),
+            "X-Model": getattr(service, "model_filename", "best_generator.pt"),
+            "X-Quality-Loss-Pct": str(analytics.quality_loss_pct),
         }
         return Response(content=out_bytes, media_type=mime_type, headers=headers)
 
