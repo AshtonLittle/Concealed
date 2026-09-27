@@ -183,14 +183,13 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({
         <div className="siglip-header-title-group">
           <h1 className="siglip-workspace-title">SigLIP Feature Probe</h1>
           <p className="siglip-workspace-sub">
-            Evaluate adversarial concealment against Google SigLIP SO400M using the exact surrogate architecture & multi-layer patch evaluations from training.
+            Test what Google SigLIP detects before and after Concealed protection for your options.
           </p>
         </div>
         <div className="siglip-header-tags-group">
           <div className="siglip-engine-tag">
             <span className="siglip-model-label">Probe:</span>
-            <strong>{probeResult?.model_name || 'google/siglip-so400m-patch14-384'}</strong>
-            <span className="siglip-arch-pill">Training Architecture ViT</span>
+            <strong>google/siglip-base-patch16-224</strong>
           </div>
           <div className="siglip-engine-tag params-tag">
             <span className="siglip-model-label">Concealing Params:</span>
@@ -370,14 +369,14 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({
             {isProbing ? (
               <>
                 <span className="btn-spinner" />
-                Evaluating with SigLIP SO400M...
+                Evaluating with SigLIP...
               </>
             ) : (
               <>
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
                   <polygon points="5 3 19 12 5 21 5 3" />
                 </svg>
-                Probe with SigLIP SO400M
+                Probe Options with SigLIP
               </>
             )}
           </button>
@@ -404,97 +403,6 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({
               <span className="stat-val drop">-{probeResult.avg_confidence_drop_pct}%</span>
             </div>
           </div>
-
-          {/* TRAINING ARCHITECTURE EVALUATIONS (SIGLIP-SO400M) */}
-          {probeResult.training_evaluations && (
-            <div className="siglip-eval-card">
-              <div className="siglip-eval-header">
-                <div className="siglip-eval-title-group">
-                  <div className="siglip-eval-title-row">
-                    <span className="siglip-eval-title">Training Architecture ViT Evaluations</span>
-                    <span className="siglip-eval-model-tag">{probeResult.training_evaluations.model_name}</span>
-                  </div>
-                  <span className="siglip-eval-sub">
-                    {probeResult.training_evaluations.architecture} • Tapped Layers [-3, -2, -1] • Multi-layer Spatial Patch Cosine
-                  </span>
-                </div>
-                <div className="siglip-eval-status-group">
-                  <span
-                    className={`siglip-verdict-pill ${
-                      probeResult.training_evaluations.identification_evaded ? 'evaded' : 'partial'
-                    }`}
-                  >
-                    {probeResult.training_evaluations.identification_evaded
-                      ? '✓ Identification Evaded'
-                      : '⚠ Partially Disrupted'}
-                  </span>
-                  <span
-                    className={`status-pill ${
-                      probeResult.training_evaluations.evasion_status === 'EVADED'
-                        ? 'hidden'
-                        : probeResult.training_evaluations.evasion_status === 'WEAKENED'
-                        ? 'weakened'
-                        : 'visible'
-                    }`}
-                  >
-                    {probeResult.training_evaluations.evasion_status}
-                  </span>
-                </div>
-              </div>
-
-              <div className="siglip-eval-grid">
-                <div className="siglip-eval-tile">
-                  <span className="tile-label">Patch Cosine Sim</span>
-                  <span className="tile-value highlight">
-                    {probeResult.training_evaluations.patch_cos_sim.toFixed(3)}
-                  </span>
-                  <span className="tile-hint">Spatial patch tokens across layers [-3, -2, -1]</span>
-                </div>
-
-                <div className="siglip-eval-tile">
-                  <span className="tile-label">Salient Patch Cosine</span>
-                  <span className="tile-value highlight">
-                    {probeResult.training_evaluations.salient_patch_cos.toFixed(3)}
-                  </span>
-                  <span className="tile-hint">Top-25% salient foreground feature patches</span>
-                </div>
-
-                <div className="siglip-eval-tile">
-                  <span className="tile-label">Global Embedding Cosine</span>
-                  <span className="tile-value">
-                    {probeResult.training_evaluations.global_cos_sim.toFixed(3)}
-                  </span>
-                  <span className="tile-hint">Full image pooled representation similarity</span>
-                </div>
-
-                <div className="siglip-eval-tile">
-                  <span className="tile-label">Patch Re-ID Evasion</span>
-                  <span className="tile-value drop">
-                    {probeResult.training_evaluations.patch_reid_evasion_pct.toFixed(1)}%
-                  </span>
-                  <span className="tile-hint">Patches evading nearest-neighbor Re-ID or &lt;0.50</span>
-                </div>
-
-                <div className="siglip-eval-tile">
-                  <span className="tile-label">Salient Attention Displacement</span>
-                  <span className="tile-value drop">
-                    {probeResult.training_evaluations.salient_displacement_pct.toFixed(1)}%
-                  </span>
-                  <span className="tile-hint">Foreground attention token relocation rate</span>
-                </div>
-
-                <div className="siglip-eval-tile">
-                  <span className="tile-label">Concealed Patches (&lt;0.50)</span>
-                  <span className="tile-value drop">
-                    {probeResult.training_evaluations.concealed_patches_50_pct.toFixed(1)}%
-                  </span>
-                  <span className="tile-hint">
-                    {probeResult.training_evaluations.concealed_patches_70_pct.toFixed(1)}% collapsed &lt;0.70
-                  </span>
-                </div>
-              </div>
-            </div>
-          )}
 
           {/* Scores Table */}
           <div className="siglip-scores-card">
