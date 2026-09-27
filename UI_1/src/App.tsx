@@ -1,39 +1,43 @@
 import { useState } from 'react';
 import { WindowFrame } from './components/WindowFrame';
 import { Sidebar } from './components/Sidebar';
+import { SettingsSidebar } from './components/SettingsSidebar';
 import { MainWorkspace } from './components/MainWorkspace';
 import { VideoWorkspace } from './components/VideoWorkspace';
-import { BenchmarkView } from './components/BenchmarkView';
 import type { AppView } from './components/WindowHeader';
 import './App.css';
 
 export function App() {
   const [currentView, setCurrentView] = useState<AppView>('image');
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(true);
 
   return (
     <WindowFrame
       currentView={currentView}
       onNavigate={setCurrentView}
+      isSidebarOpen={isSidebarOpen}
+      onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
+      isSettingsOpen={isSettingsOpen}
+      onToggleSettings={() => setIsSettingsOpen((prev) => !prev)}
     >
-      <Sidebar />
-      {currentView === 'image' && (
-        <MainWorkspace
-          isSettingsOpen={isSettingsOpen}
-          onToggleSettings={() => setIsSettingsOpen((prev) => !prev)}
-          onCloseSettings={() => setIsSettingsOpen(false)}
-        />
-      )}
-      {currentView === 'video' && (
-        <VideoWorkspace
-          isSettingsOpen={isSettingsOpen}
-          onToggleSettings={() => setIsSettingsOpen((prev) => !prev)}
-          onCloseSettings={() => setIsSettingsOpen(false)}
-        />
-      )}
-      {currentView === 'benchmark' && (
-        <BenchmarkView onBack={() => setCurrentView('image')} />
-      )}
+      {/* Left Column: Statistics */}
+      <Sidebar
+        isOpen={isSidebarOpen}
+        onToggle={() => setIsSidebarOpen((prev) => !prev)}
+        currentView={currentView === 'video' ? 'video' : 'image'}
+      />
+
+      {/* Middle Column: Centered Workspace */}
+      {currentView === 'image' && <MainWorkspace />}
+      {currentView === 'video' && <VideoWorkspace />}
+
+      {/* Right Column: Settings (Mirrors Left Column) */}
+      <SettingsSidebar
+        isOpen={isSettingsOpen}
+        onToggle={() => setIsSettingsOpen((prev) => !prev)}
+        currentView={currentView === 'video' ? 'video' : 'image'}
+      />
     </WindowFrame>
   );
 }

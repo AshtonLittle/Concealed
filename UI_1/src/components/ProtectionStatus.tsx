@@ -101,7 +101,20 @@ export const ProtectionStatus: React.FC = () => {
               title="Remove selected file"
               aria-label="Remove selected file"
             >
-              ✕
+              <svg
+                viewBox="0 0 24 24"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
             </button>
           </div>
         ) : (
@@ -122,24 +135,19 @@ export const ProtectionStatus: React.FC = () => {
               <polyline points="17 8 12 3 7 8" />
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
-            <span className="dropbox-prompt-title">Select an image or file</span>
+            <span className="dropbox-prompt-title">Select an image</span>
             <span className="dropbox-prompt-subtitle">or drag and drop here</span>
           </div>
         )}
       </div>
 
-      {/* Slogan under drop box */}
+      {/* Headline & Tagline under drop box */}
       <h2 className="protection-headline">
-        Stay Safe. Not Sorry
+        Stay Concealed
       </h2>
-
-      {/* Subtitle / Status Line */}
-      <div className="protection-status-line">
-        <span className="status-indicator-dot" aria-hidden="true" />
-        <span className="protection-submessage">
-          IMAGE PROTECTION ACTIVE
-        </span>
-      </div>
+      <p className="protection-tagline">
+        Digital Camouflage
+      </p>
     </div>
   );
 };

@@ -1,18 +1,6 @@
 import React, { useState, useRef } from 'react';
-import { SettingsButton } from './SettingsButton';
-import { SettingsPanel } from './SettingsPanel';
 
-interface VideoWorkspaceProps {
-  isSettingsOpen: boolean;
-  onToggleSettings: () => void;
-  onCloseSettings: () => void;
-}
-
-export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
-  isSettingsOpen,
-  onToggleSettings,
-  onCloseSettings,
-}) => {
+export const VideoWorkspace: React.FC = () => {
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -65,14 +53,6 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
 
   return (
     <main className="main-workspace" aria-label="Video protection workspace">
-      {/* Top right iOS-style Settings Button */}
-      <div className="workspace-top-bar">
-        <SettingsButton
-          isOpen={isSettingsOpen}
-          onClick={onToggleSettings}
-        />
-      </div>
-
       {/* Centered Video Protection Content */}
       <div className="workspace-content">
         <div className="protection-status-center" aria-live="polite">
@@ -147,7 +127,20 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
                   title="Remove selected video"
                   aria-label="Remove selected video"
                 >
-                  ✕
+                  <svg
+                    viewBox="0 0 24 24"
+                    width="12"
+                    height="12"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
                 </button>
               </div>
             ) : (
@@ -168,31 +161,20 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
                   <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
                 </svg>
                 <span className="dropbox-prompt-title">Select a video file</span>
-                <span className="dropbox-prompt-subtitle">or drag and drop MP4, MOV, WEBM</span>
+                <span className="dropbox-prompt-subtitle">or drag and drop here</span>
               </div>
             )}
           </div>
 
-          {/* Slogan under video drop box */}
+          {/* Headline & Tagline under video drop box */}
           <h2 className="protection-headline">
-            Stay Safe. Not Sorry
+            Stay Concealed
           </h2>
-
-          {/* Subtitle / Status Line */}
-          <div className="protection-status-line">
-            <span className="status-indicator-dot" aria-hidden="true" />
-            <span className="protection-submessage">
-              VIDEO PROTECTION ACTIVE
-            </span>
-          </div>
+          <p className="protection-tagline">
+            Digital Camouflage
+          </p>
         </div>
       </div>
-
-      {/* Settings Dialog / Panel */}
-      <SettingsPanel
-        isOpen={isSettingsOpen}
-        onClose={onCloseSettings}
-      />
     </main>
   );
 };
