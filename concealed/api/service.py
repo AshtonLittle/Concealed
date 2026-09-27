@@ -331,6 +331,9 @@ class ObfuscationService:
         else:
             self.backend_name = "Algorithmic-DCT-Engine"
 
+        self.last_engine_filename = "generator.onnx" if self.onnx_engine is not None else ("best_generator.pt" if self.pt_engine is not None else "algorithmic")
+        self.model_filename = self.last_engine_filename
+
         # Initialize Transformer / VLM Evasion Probe Service
         from concealed.api.probe_service import ModelProbeService
         self.probe_service = ModelProbeService(device=self.device_str)
@@ -545,18 +548,25 @@ class ObfuscationService:
         if req_eng in ("pt", "pytorch", "best_generator.pt") and self.pt_engine is not None:
             active_engine = self.pt_engine
             engine_label = "PyTorch (best_generator.pt)"
+            engine_filename = "best_generator.pt"
         elif req_eng in ("onnx", "generator.onnx") and self.onnx_engine is not None:
             active_engine = self.onnx_engine
             engine_label = "ONNXRuntime (generator.onnx)"
+            engine_filename = "generator.onnx"
         elif self.onnx_engine is not None:
             active_engine = self.onnx_engine
             engine_label = "ONNXRuntime (generator.onnx)"
+            engine_filename = "generator.onnx"
         elif self.pt_engine is not None:
             active_engine = self.pt_engine
             engine_label = "PyTorch (best_generator.pt)"
+            engine_filename = "best_generator.pt"
         else:
             active_engine = None
             engine_label = "Algorithmic-DCT-Engine"
+            engine_filename = "algorithmic"
+
+        self.last_engine_filename = engine_filename
 
         if active_engine is not None:
             try:
@@ -603,6 +613,7 @@ class ObfuscationService:
                     obf_pil = Image.fromarray(obf_rgb)
             except Exception as e:
                 print(f"[ObfuscationService] Generator ({engine_label}) forward error ({e}), falling back to algorithmic engine.")
+                self.last_engine_filename = "algorithmic"
                 delta = self._synthesize_delta(clean_rgb, params)
                 obf_rgb = np.clip(clean_rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
                 obf_pil = Image.fromarray(obf_rgb)
