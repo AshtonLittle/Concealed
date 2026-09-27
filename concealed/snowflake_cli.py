@@ -379,27 +379,29 @@ def _print_stage_epoch_reports(
     acct_label: str,
     out_dir_path: Path,
     printed_epochs: set[int],
-) -> int:
+) -> tuple[int, bool]:
     out_dir_path.mkdir(parents=True, exist_ok=True)
     try:
         session.file.get("@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/training_log.json", str(out_dir_path))
     except Exception:
-        return 0
+        return 0, False
     log_file = out_dir_path / "training_log.json"
     if not log_file.exists():
-        return 0
+        return 0, False
     try:
         history = json.loads(log_file.read_text(encoding="utf-8"))
     except Exception:
-        return 0
+        return 0, False
 
     max_ep = 0
+    found_new = False
     for entry in history:
         ep = int(entry.get("epoch", 0))
         max_ep = max(max_ep, ep)
         if ep in printed_epochs:
             continue
         printed_epochs.add(ep)
+        found_new = True
         val_s = entry.get("val", {})
         el = float(entry.get("elapsed_sec", 0.0))
         with _PRINT_LOCK:
@@ -411,7 +413,7 @@ def _print_stage_epoch_reports(
                 f"| Identification Stat: Feature ID Evasion = {val_s.get('feature_reid_evasion_pct', 0.0):5.1f}% | Semantic Category Flip = {val_s.get('semantic_neighbor_flip_pct', 0.0):5.1f}%\n"
                 f"| Spatial Masking    : Patches <0.70 Sim  = {val_s.get('concealed_patches_70_pct', 0.0):5.1f}% | Patches <0.50 Sim      = {val_s.get('concealed_patches_50_pct', 0.0):5.1f}%\n"
                 f"| Visual Stealth     : PSNR = {val_s.get('psnr_db', 0.0):.2f} dB | Chroma Shift = {val_s.get('chroma_rms_255', 0.0):.2f}/255 | L_inf = {val_s.get('linf_255', 0.0):.2f}/255 | UAP Ratio = {val_s.get('uap_collapse_ratio', 0.0):.3f}\n"
-                f"| Per-Transformer Breakdown:",
+                f"| Per-Transformer Evasion & Scramble Breakdown:",
                 flush=True,
             )
             for k, v in val_s.items():
@@ -419,20 +421,75 @@ def _print_stage_epoch_reports(
                     s_name = k.split("/", 1)[1]
                     s_c = val_s.get(f"salient_cos/{s_name}", 0.0)
                     g_c = val_s.get(f"global_cos/{s_name}", 0.0)
+                    c70 = val_s.get(f"conc70/{s_name}", 0.0)
+                    c50 = val_s.get(f"conc50/{s_name}", 0.0)
                     ev_p = val_s.get(f"reid_evasion_pct/{s_name}", 0.0)
                     fl_p = val_s.get(f"semantic_flip_pct/{s_name}", 0.0)
+                    status_tag = (
+                        "[EVADED / SCRAMBLED]"
+                        if (v < 0.72 or g_c < 0.55 or ev_p > 50.0)
+                        else ("[PARTIALLY DISRUPTED]" if (v < 0.85 or ev_p > 25.0) else "[VULNERABLE]")
+                    )
                     print(
-                        f"|   * {s_name:28s} -> PatchCos: {v:.4f} | SalientCos: {s_c:.4f} | GlobalCos: {g_c:.4f} | ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
+                        f"|   * {s_name:24s} {status_tag:21s} -> Patch: {v:.4f} (Salient: {s_c:.4f}) | Global: {g_c:.4f} | Grid(<0.7/<0.5): {c70:4.1f}%/{c50:4.1f}% | Re-ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
                         flush=True,
                     )
             print("+---------------------------------------------------------------------------------------+", flush=True)
-    return max_ep
+    return max_ep, found_new
+
+
+def _run_live_reference_test(merged_pt: Path, test_image_path: Path) -> None:
+    """Run a fast live Evasion/Scramble check on a local reference image after fleet checkpoint merge."""
+    if not merged_pt.exists() or not test_image_path.exists():
+        return
+    try:
+        from PIL import Image
+        from concealed.pipeline.realtime import RealtimeObfuscator
+
+        obf = RealtimeObfuscator(merged_pt, device="cpu")
+        with Image.open(test_image_path) as img:
+            clean_rgb = img.convert("RGB")
+            # Evaluate at up to 1280px max side for fast (<4s) live in-loop verification
+            w, h = clean_rgb.size
+            if max(w, h) > 1280:
+                scale = 1280.0 / float(max(w, h))
+                clean_rgb = clean_rgb.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BICUBIC)
+            prot_rgb = obf.obfuscate_pil(clean_rgb)
+            report = obf.analyze_image_pair(clean_rgb, prot_rgb)
+
+        st = report["stealth"]
+        models = report.get("models", {})
+        with _PRINT_LOCK:
+            print(
+                f"  [Live Reference Test: {test_image_path.name}] "
+                f"PSNR={st['psnr_db']:.2f}dB | SSIM={st['ssim']:.4f} | L_inf={st['linf_255']:.1f}/255 | "
+                f"MeanReID={report.get('mean_reid_evasion_pct', 0.0):.1f}%",
+                flush=True,
+            )
+            for m_name, m_stat in models.items():
+                short_m = m_name.split("/")[-1][:22]
+                p_c = m_stat["patch_cosine_sim"]
+                g_c = m_stat["global_cosine_sim"]
+                ev = m_stat["reid_evasion_pct"]
+                badge = (
+                    "[EVADED / SCRAMBLED]"
+                    if (p_c < 0.72 or g_c < 0.55 or ev > 50.0)
+                    else ("[PARTIALLY DISRUPTED]" if (p_c < 0.85 or ev > 25.0) else "[VULNERABLE]")
+                )
+                print(
+                    f"    -> {short_m:22s} {badge:21s} PatchCos={p_c:.4f} | GlobalCos={g_c:.4f} | Grid<0.7={m_stat['concealed_patches_70_pct']:4.1f}% | Re-ID Evasion={ev:4.1f}%",
+                    flush=True,
+                )
+    except Exception as exc:
+        with _PRINT_LOCK:
+            print(f"  (Live test note: {exc})", flush=True)
 
 
 def _sync_and_merge_fleet_checkpoints(
     out_dir: Path,
     worker_dirs: List[Path],
     base_checkpoint: Optional[Path] = None,
+    test_image: Optional[Path] = None,
 ) -> Optional[Path]:
     """Merge all available worker `best_generator.pt` checkpoints into `out_dir / best_generator.pt` + ONNX."""
     ckpt_paths = [d / "best_generator.pt" for d in worker_dirs if (d / "best_generator.pt").exists()]
@@ -451,22 +508,28 @@ def _sync_and_merge_fleet_checkpoints(
     )
 
     m = merge_info.get("metrics", {})
-    print(
-        f"\n+=======================================================================================+\n"
-        f"| MULTI-ACCOUNT FLEET MODEL SOUP / TASK-VECTOR MERGE COMPLETE ({merge_info['num_merged']} GPU Nodes)\n"
-        f"+=======================================================================================+\n"
-        f"| Worker Weights     : {merge_info['weights']}\n"
-        f"| Merged Val Metrics : PatchCos = {m.get('patch_cos_sim', 0.0):.4f} | SalientCos = {m.get('salient_patch_cos', 0.0):.4f} | SemanticFlip = {m.get('semantic_neighbor_flip_pct', 0.0):.1f}%\n"
-        f"| Saved Checkpoint   : {merged_pt}\n"
-        f"+=======================================================================================+",
-        flush=True,
-    )
+    with _PRINT_LOCK:
+        print(
+            f"\n+=======================================================================================+\n"
+            f"| MULTI-ACCOUNT FLEET MODEL SOUP / TASK-VECTOR MERGE COMPLETE ({merge_info['num_merged']} GPU Nodes)\n"
+            f"+=======================================================================================+\n"
+            f"| Worker Weights     : {merge_info['weights']}\n"
+            f"| Merged Val Metrics : PatchCos = {m.get('patch_cos_sim', 0.0):.4f} | SalientCos = {m.get('salient_patch_cos', 0.0):.4f} | Re-ID Evasion = {m.get('feature_reid_evasion_pct', 0.0):.1f}% | SemFlip = {m.get('semantic_neighbor_flip_pct', 0.0):.1f}%\n"
+            f"| Saved Checkpoint   : {merged_pt}\n"
+            f"+=======================================================================================+",
+            flush=True,
+        )
 
     try:
         onnx_info = export_to_onnx(gen, out_dir / "generator.onnx", verify=True)
-        print(f"Exported unified ONNX model -> {onnx_info['onnx_path']} ({onnx_info['size_mb']} MB)")
+        with _PRINT_LOCK:
+            print(f"Exported unified ONNX model -> {onnx_info['onnx_path']} ({onnx_info['size_mb']} MB)", flush=True)
     except Exception as exc:
-        print(f"  (ONNX export warning: {exc})")
+        with _PRINT_LOCK:
+            print(f"  (ONNX export warning: {exc})", flush=True)
+
+    if test_image is not None and test_image.exists():
+        _run_live_reference_test(merged_pt, test_image)
 
     return merged_pt
 
@@ -563,6 +626,12 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs")
     parser.add_argument("--surrogates", type=str, nargs="+", default=None, help="Override ViT surrogate model names")
     parser.add_argument(
+        "--test-image",
+        type=str,
+        default=None,
+        help="Optional local reference image to benchmark Evasion/Scramble live after each merged epoch",
+    )
+    parser.add_argument(
         "--force-upload",
         action="store_true",
         help="Force re-uploading images_bundle.tar and model cache even if already on Snowflake Stage",
@@ -570,11 +639,21 @@ def main() -> None:
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
+    test_image_path: Optional[Path] = None
+    if args.test_image and Path(args.test_image).exists():
+        test_image_path = Path(args.test_image)
+    else:
+        for cand_name in ("WIN_20260926_19_06_29_Pro.jpg", "pexels-beil-3642644.jpg"):
+            if Path(cand_name).exists():
+                test_image_path = Path(cand_name)
+                break
 
     if args.merge:
         worker_dirs = sorted([d for d in out_dir.glob("account_*") if d.is_dir()])
         base_init = out_dir / "init_base_generator.pt"
-        _sync_and_merge_fleet_checkpoints(out_dir, worker_dirs, base_checkpoint=base_init)
+        _sync_and_merge_fleet_checkpoints(
+            out_dir, worker_dirs, base_checkpoint=base_init, test_image=test_image_path
+        )
         return
 
     try:
@@ -662,7 +741,7 @@ def main() -> None:
                 continue
 
             printed: set[int] = set()
-            latest_ep = _print_stage_epoch_reports(sess, acct.label, w_dir, printed)
+            latest_ep, _ = _print_stage_epoch_reports(sess, acct.label, w_dir, printed)
             if latest_ep > 0:
                 print(f"[{acct.label}] Syncing latest checkpoint (Epoch {latest_ep}) -> {w_dir} ...")
                 try:
@@ -682,11 +761,15 @@ def main() -> None:
 
         if num_workers > 1:
             base_init = out_dir / "init_base_generator.pt"
-            _sync_and_merge_fleet_checkpoints(out_dir, worker_dirs, base_checkpoint=base_init)
+            _sync_and_merge_fleet_checkpoints(
+                out_dir, worker_dirs, base_checkpoint=base_init, test_image=test_image_path
+            )
         elif (out_dir / "best_generator.pt").exists():
             gen, _ = load_generator_checkpoint(out_dir / "best_generator.pt", device="cpu")
             onnx_info = export_to_onnx(gen, out_dir / "generator.onnx", verify=True)
             print(f"Updated local ONNX model -> {onnx_info['onnx_path']} ({onnx_info['size_mb']} MB)")
+            if test_image_path is not None:
+                _run_live_reference_test(out_dir / "best_generator.pt", test_image_path)
         return
 
     if not args.data_dir:
@@ -730,6 +813,29 @@ def main() -> None:
         base_config.setdefault("training", {})["warmup_epochs"] = 1
         base_config.setdefault("training", {})["lr"] = 6.0e-4
         base_config.setdefault("training", {})["max_images"] = total_poc_images
+    else:
+        # Full Production Mode (Non-PoC): 384x384 Hybrid Multi-Scale Synthesis across all 5,000 images
+        # Optimized for 24GB NVIDIA A10G GPUs (batch_size=8 when using fast profile)
+        default_epochs = int(base_config.get("training", {}).get("epochs", 40))
+        eff_epochs = args.epochs if args.epochs is not None else default_epochs
+        base_config.setdefault("generator", {})["mode"] = "hybrid"
+        base_config.setdefault("generator", {})["canonical_size"] = 256
+        base_config.setdefault("generator", {})["tile_size"] = 384
+        base_config.setdefault("generator", {})["epsilon_255"] = 8.0
+        base_config.setdefault("loss", {})["patch_cosine_weight"] = 3.5
+        base_config.setdefault("loss", {})["global_cosine_weight"] = 2.0
+        base_config.setdefault("loss", {})["patch_dispersion_weight"] = 0.85
+        base_config.setdefault("training", {})["train_resolution"] = 384
+        if args.profile == "fast":
+            base_config.setdefault("surrogates", {})["sequential_grad_accum"] = False
+            base_config.setdefault("training", {})["batch_size"] = 8
+            base_config.setdefault("training", {})["grad_accumulation_steps"] = 1
+            base_config.setdefault("training", {})["lr"] = 4.0e-4
+        print(
+            f"  -> Full Production Training across {num_workers} Snowflake Account(s): "
+            f"{len(all_images)} total images (~{int(len(all_images) * 0.9) // num_workers} train + {int(len(all_images) * 0.1)} shared val/GPU), "
+            f"{eff_epochs} epochs @ 384x384 hybrid mode, strategy={args.fleet_strategy}"
+        )
 
     if args.max_images is not None:
         base_config.setdefault("training", {})["max_images"] = args.max_images
@@ -767,6 +873,7 @@ def main() -> None:
         (str(repo_root / "concealed"), "concealed"),
         (str(timm_pkg_dir), "timm"),
     ]
+    total_pool_count = len(all_images)
 
     def _provision_and_launch_worker(worker_idx: int, acct: SnowflakeAccountSpec, sess):
         with _PRINT_LOCK:
@@ -853,6 +960,7 @@ def main() -> None:
             cfg: dict,
             cached_hf_bundle: str | None,
             warm_start_ckpt_name: str | None,
+            full_pool_size: int = 5000,
         ) -> dict:
             import os
             from pathlib import Path
@@ -903,6 +1011,13 @@ def main() -> None:
             else:
                 sp_session.file.get("@CONCEALED_DB.PUBLIC.IMAGE_STAGE", str(local_imgs))
 
+            # Safeguard: if the cached stage bundle was already pre-sharded (e.g. 1,625 images out of 5,000),
+            # do not slice it a second time inside the container.
+            extracted_files = [p for p in local_imgs.rglob("*") if p.is_file()]
+            if full_pool_size > 2500 and len(extracted_files) < int(full_pool_size * 0.65):
+                cfg.setdefault("training", {})["num_shards"] = 1
+                cfg.setdefault("training", {})["shard_id"] = 0
+
             def _sync_epoch_artifacts(ep: int, out_dir_path: Path, _val_metrics: dict) -> None:
                 for fname in ("best_generator.pt", "latest_generator.pt", "training_log.json"):
                     p = out_dir_path / fname
@@ -940,6 +1055,7 @@ def main() -> None:
             worker_cfg,
             hf_bundle_name,
             init_ckpt_path.name if (has_init_ckpt and init_ckpt_path) else None,
+            total_pool_count,
         )
         with _PRINT_LOCK:
             print(f"[{acct.label}] Dispatched! Job ID: {job.id} | Role: {role_desc}")
@@ -958,7 +1074,7 @@ def main() -> None:
     active_workers.sort(key=lambda x: x[0].slot)
     print(
         f"\nAll {len(active_workers)} Snowflake GPU node(s) are running! "
-        f"Streaming unified fleet analytics (press Ctrl+C after any epoch to sync & merge)..."
+        f"Streaming unified fleet analytics & rolling live merges (press Ctrl+C at any point to stop)..."
     )
 
     seen_lines_per_slot: Dict[int, set[str]] = {w[0].slot: set() for w in active_workers}
@@ -986,6 +1102,7 @@ def main() -> None:
     try:
         while True:
             all_finished = True
+            any_new_epoch = False
             for acct, sess, job, _role in active_workers:
                 st = str(job.status).upper()
                 if st not in {"DONE", "FAILED", "CANCELLED", "INTERNAL_ERROR", "DELETED"}:
@@ -1005,12 +1122,32 @@ def main() -> None:
                 except Exception:
                     pass
 
-                _print_stage_epoch_reports(
+                _, found_new = _print_stage_epoch_reports(
                     sess,
                     acct.label,
                     worker_dirs[acct.slot],
                     printed_epochs_per_slot[acct.slot],
                 )
+                if found_new:
+                    any_new_epoch = True
+                    try:
+                        sess.file.get(
+                            "@CONCEALED_DB.PUBLIC.MODEL_STAGE/latest/best_generator.pt",
+                            str(worker_dirs[acct.slot]),
+                        )
+                    except Exception:
+                        pass
+
+            if any_new_epoch:
+                if num_workers > 1:
+                    _sync_and_merge_fleet_checkpoints(
+                        out_dir=out_dir,
+                        worker_dirs=[worker_dirs[w[0].slot] for w in active_workers],
+                        base_checkpoint=init_ckpt_path,
+                        test_image=test_image_path,
+                    )
+                elif (out_dir / "best_generator.pt").exists() and test_image_path is not None:
+                    _run_live_reference_test(out_dir / "best_generator.pt", test_image_path)
 
             if all_finished:
                 break
@@ -1035,6 +1172,7 @@ def main() -> None:
             out_dir=out_dir,
             worker_dirs=[worker_dirs[w[0].slot] for w in active_workers],
             base_checkpoint=init_ckpt_path,
+            test_image=test_image_path,
         )
     else:
         best_pt = out_dir / "best_generator.pt"
@@ -1042,6 +1180,8 @@ def main() -> None:
             gen, _ = load_generator_checkpoint(best_pt, device="cpu")
             onnx_info = export_to_onnx(gen, out_dir / "generator.onnx", verify=True)
             print(f"Exported verified real-time ONNX model -> {onnx_info['onnx_path']} ({onnx_info['size_mb']} MB)")
+            if test_image_path is not None:
+                _run_live_reference_test(best_pt, test_image_path)
 
 
 if __name__ == "__main__":

@@ -562,13 +562,17 @@ def train(
                 elapsed_all = time.perf_counter() - train_start_time
                 eta_sec = (elapsed_all / max(done_total, 1)) * max(0, all_total - done_total)
                 eta_m, eta_s = int(eta_sec // 60), int(eta_sec % 60)
+                per_mod_live = " | ".join(
+                    f"{sn.split('-')[0]}:{metrics.get(f'patch_cos/{sn}', 0.0):.2f}({metrics.get(f'conc70/{sn}', 0.0):.0f}%)"
+                    for sn in model_short_names
+                )
                 print(
                     f"  [Live Step {idx + 1:03d}/{len(train_loader):03d} | Ep {epoch}/{epochs} | ETA {eta_m}m{eta_s:02d}s] "
                     f"PatchCos={metrics['patch_cos_sim']:.3f} | "
                     f"SalientCos={metrics.get('salient_patch_cos', 0.0):.3f} | "
                     f"GlobalCos={metrics['global_cos_sim']:.3f} | "
-                    f"ConcealedPatches(<0.7)={metrics.get('concealed_patches_70_pct', 0.0):.1f}% | "
-                    f"ChromaRMS={metrics.get('chroma_rms_255', 0.0):.2f}/255",
+                    f"Scrambled(<0.7)={metrics.get('concealed_patches_70_pct', 0.0):.1f}% | "
+                    f"[{per_mod_live}]",
                     flush=True,
                 )
 
@@ -606,25 +610,38 @@ def train(
             f"| Identification Stat: Feature ID Evasion = {val_summary.get('feature_reid_evasion_pct', 0.0):5.1f}% | Semantic Category Flip = {val_summary.get('semantic_neighbor_flip_pct', 0.0):5.1f}%\n"
             f"| Spatial Masking    : Patches <0.70 Sim  = {val_summary.get('concealed_patches_70_pct', 0.0):5.1f}% | Patches <0.50 Sim      = {val_summary.get('concealed_patches_50_pct', 0.0):5.1f}%\n"
             f"| Visual Stealth     : PSNR = {val_summary['psnr_db']:.2f} dB | Chroma Shift = {val_summary.get('chroma_rms_255', 0.0):.2f}/255 | L_inf = {val_summary['linf_255']:.2f}/255 | UAP Ratio = {val_summary.get('uap_collapse_ratio', 0.0):.3f}\n"
-            f"| Per-Transformer Breakdown:",
+            f"| Per-Transformer Evasion & Scramble Breakdown:",
             flush=True,
         )
         for s_name in model_short_names:
             p_c = val_summary.get(f"patch_cos/{s_name}", 0.0)
             s_c = val_summary.get(f"salient_cos/{s_name}", 0.0)
             g_c = val_summary.get(f"global_cos/{s_name}", 0.0)
+            c70 = val_summary.get(f"conc70/{s_name}", 0.0)
+            c50 = val_summary.get(f"conc50/{s_name}", 0.0)
             ev_p = val_summary.get(f"reid_evasion_pct/{s_name}", 0.0)
             fl_p = val_summary.get(f"semantic_flip_pct/{s_name}", 0.0)
+            status_tag = (
+                "[EVADED / SCRAMBLED]"
+                if (p_c < 0.72 or g_c < 0.55 or ev_p > 50.0)
+                else ("[PARTIALLY DISRUPTED]" if (p_c < 0.85 or ev_p > 25.0) else "[VULNERABLE]")
+            )
             print(
-                f"|   * {s_name:28s} -> PatchCos: {p_c:.4f} | SalientCos: {s_c:.4f} | GlobalCos: {g_c:.4f} | ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
+                f"|   * {s_name:24s} {status_tag:21s} -> Patch: {p_c:.4f} (Salient: {s_c:.4f}) | Global: {g_c:.4f} | Grid(<0.7/<0.5): {c70:4.1f}%/{c50:4.1f}% | Re-ID Evasion: {ev_p:5.1f}% | SemFlip: {fl_p:5.1f}%",
                 flush=True,
             )
         print("+---------------------------------------------------------------------------------------+\n", flush=True)
 
-        # Save latest & best checkpoints
+        # Save latest & best checkpoints (using composite evasion quality score)
         save_checkpoint(out_dir / "latest_generator.pt", generator, ema, config, epoch, val_summary)
-        if val_summary["patch_cos_sim"] < best_patch_cos:
-            best_patch_cos = val_summary["patch_cos_sim"]
+        composite_cos = (
+            0.55 * val_summary["patch_cos_sim"]
+            + 0.30 * val_summary.get("salient_patch_cos", val_summary["patch_cos_sim"])
+            + 0.15 * val_summary["global_cos_sim"]
+            - 0.0015 * val_summary.get("feature_reid_evasion_pct", 0.0)
+        )
+        if composite_cos < best_patch_cos:
+            best_patch_cos = composite_cos
             save_checkpoint(out_dir / "best_generator.pt", generator, ema, config, epoch, val_summary)
 
         if epoch % save_every == 0:
