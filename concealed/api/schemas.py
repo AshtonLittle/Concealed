@@ -279,6 +279,22 @@ class SiglipOptionScore(BaseModel):
     status: str  # 'Hidden' | 'Weakened' | 'Visible'
 
 
+class SiglipTrainingEvaluations(BaseModel):
+    """Exact Vision Transformer evaluation metrics computed by the Concealed training architecture."""
+
+    model_name: str = "google/siglip-so400m-patch14-384"
+    architecture: str = "SigLIP-SO400M (384x384, patch14, 400M params)"
+    patch_cos_sim: float
+    salient_patch_cos: float
+    global_cos_sim: float
+    patch_reid_evasion_pct: float
+    salient_displacement_pct: float
+    concealed_patches_70_pct: float
+    concealed_patches_50_pct: float
+    identification_evaded: bool
+    evasion_status: str  # "EVADED" | "WEAKENED" | "VISIBLE"
+
+
 class SiglipProbeResponse(BaseModel):
     """Response from real SigLIP probe on a user-provided list of options."""
 
@@ -289,6 +305,8 @@ class SiglipProbeResponse(BaseModel):
     options_hidden_count: int
     total_options: int
     avg_confidence_drop_pct: float
+    model_name: str = "google/siglip-so400m-patch14-384"
+    training_evaluations: Optional[SiglipTrainingEvaluations] = None
     results: List[SiglipOptionScore]
     # Benchmarking: which obfuscation produced the concealed image + fidelity cost
     conceal_engine_used: Optional[str] = None
@@ -297,5 +315,6 @@ class SiglipProbeResponse(BaseModel):
     ssim: Optional[float] = None
     linf_255: Optional[float] = None
     rmse_255: Optional[float] = None
+
 
 

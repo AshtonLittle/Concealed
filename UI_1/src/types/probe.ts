@@ -77,6 +77,20 @@ export interface ModelsCatalogResponse {
   current_image_model: string;
 }
 
+export interface SiglipTrainingEvaluations {
+  model_name: string;
+  architecture: string;
+  patch_cos_sim: number;
+  salient_patch_cos: number;
+  global_cos_sim: number;
+  patch_reid_evasion_pct: number;
+  salient_displacement_pct: number;
+  concealed_patches_70_pct: number;
+  concealed_patches_50_pct: number;
+  identification_evaded: boolean;
+  evasion_status: 'EVADED' | 'WEAKENED' | 'VISIBLE' | string;
+}
+
 export interface SiglipOptionScore {
   option: string;
   clean_confidence_pct: number;
@@ -93,6 +107,8 @@ export interface SiglipProbeResponse {
   options_hidden_count: number;
   total_options: number;
   avg_confidence_drop_pct: number;
+  model_name?: string;
+  training_evaluations?: SiglipTrainingEvaluations;
   results: SiglipOptionScore[];
   conceal_engine_used?: string | null;
   obfuscation_epsilon?: number | null;
