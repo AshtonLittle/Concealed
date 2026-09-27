@@ -68,6 +68,8 @@ class RealtimeObfuscator:
                 sess_options = ort.SessionOptions()
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 sess_options.intra_op_num_threads = min(8, os.cpu_count() or 4)
+                sess_options.inter_op_num_threads = 1
+                sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
                 self.ort_session = ort.InferenceSession(str(path), sess_options, providers=active_providers)
             else:

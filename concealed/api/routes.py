@@ -522,11 +522,12 @@ async def obfuscate_video_frames(
     file: UploadFile = File(..., description="Video file to break into frames and obfuscate"),
     epsilon: float = Form(8.0, ge=0.5, le=64.0, description="L_infinity perturbation budget"),
     mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID, description="Synthesis mode"),
-    max_frames: int = Form(24, ge=1, le=120, description="Maximum number of frames to extract and obfuscate"),
+    max_frames: Optional[int] = Form(None, ge=1, le=100000, description="Optional cap on frames to process; omit to process every frame"),
     frame_step: int = Form(1, ge=1, le=30, description="Frame sampling step interval"),
 ) -> Response:
     """Break video into individual frames, execute the fast ONNX obfuscation model on each frame,
-    and return individual frame status, before/after visualizer imagery, and reconstructed video."""
+    and return individual frame status, before/after visualizer imagery, and reconstructed video.
+    All frames are processed unless max_frames explicitly caps the run."""
     try:
         video_bytes = await file.read()
         if not video_bytes:
@@ -566,11 +567,12 @@ async def obfuscate_video_stream_frames(
     file: UploadFile = File(..., description="Video file to break into frames and obfuscate"),
     epsilon: float = Form(8.0, ge=0.5, le=64.0, description="L_infinity perturbation budget"),
     mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID, description="Synthesis mode"),
-    max_frames: int = Form(24, ge=1, le=120, description="Maximum number of frames to extract and obfuscate"),
+    max_frames: Optional[int] = Form(None, ge=1, le=100000, description="Optional cap on frames to process; omit to process every frame"),
     frame_step: int = Form(1, ge=1, le=30, description="Frame sampling step interval"),
 ) -> StreamingResponse:
     """Break video into individual frames, execute the fast ONNX obfuscation model on each frame,
-    and stream individual frame status and before/after visualizer imagery in real-time via SSE."""
+    and stream individual frame status and before/after visualizer imagery in real-time via SSE.
+    All frames are processed unless max_frames explicitly caps the run."""
     try:
         video_bytes = await file.read()
         if not video_bytes:

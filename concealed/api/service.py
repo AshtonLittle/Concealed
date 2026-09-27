@@ -334,9 +334,41 @@ class ObfuscationService:
         self.last_engine_filename = "generator.onnx" if self.onnx_engine is not None else ("best_generator.pt" if self.pt_engine is not None else "algorithmic")
         self.model_filename = self.last_engine_filename
 
+        # Dedicated single-pass video engine: generator-video.onnx runs the same
+        # trained weights in canonical_residual mode (1 backbone pass instead of
+        # 2) at ~3x lower per-frame latency. Falls back to torch_engine.
+        self.video_engine = None
+        self.video_model_path = None
+        self.video_backend_name = self.backend_name
+        video_candidates = [
+            os.environ.get("CONCEALED_VIDEO_ONNX_MODEL"),
+            "generator-video.onnx",
+            os.path.join(os.getcwd(), "generator-video.onnx"),
+            os.path.join(os.path.dirname(__file__), "..", "..", "generator-video.onnx"),
+        ]
+        for c in video_candidates:
+            if c and os.path.exists(c):
+                try:
+                    from concealed.pipeline.realtime import RealtimeObfuscator
+                    self.video_engine = RealtimeObfuscator(c, device=self.device_str)
+                    self.video_model_path = str(os.path.abspath(c))
+                    self.video_backend_name = f"ONNXRuntime-Video ({os.path.basename(self.video_model_path)})"
+                    print(f"[ObfuscationService] Loaded video engine from '{self.video_model_path}' on {self.device_str}")
+                    break
+                except Exception as e:
+                    print(f"[ObfuscationService] Could not load video model ({c}): {e}")
+
         # Initialize Transformer / VLM Evasion Probe Service
         from concealed.api.probe_service import ModelProbeService
         self.probe_service = ModelProbeService(device=self.device_str)
+
+    def _frame_engine(self):
+        """Engine used for video frame obfuscation (fast single-pass when available)."""
+        return self.video_engine or self.torch_engine
+
+    def _frame_backend_id(self) -> str:
+        eng = self._frame_engine()
+        return "onnx" if (eng is not None and getattr(eng, "backend", "") == "onnx") else "torch"
 
     def get_status(self) -> Dict[str, Any]:
         """Return engine capabilities and device status."""
@@ -351,6 +383,8 @@ class ObfuscationService:
             "torch_available": _TORCH_AVAILABLE,
             "scipy_available": _SCIPY_AVAILABLE,
             "torch_engine_active": (self.onnx_engine is not None or self.pt_engine is not None),
+            "video_backend": self.video_backend_name,
+            "video_model_path": self.video_model_path,
         }
 
     def get_available_models(self) -> Dict[str, Any]:
@@ -782,10 +816,11 @@ class ObfuscationService:
                 if not ret:
                     break
 
-                # Process frame using RealtimeObfuscator (ONNX Runtime or PyTorch)
-                if self.torch_engine is not None:
+                # Process frame using the fast video engine (single-pass ONNX when available)
+                frame_eng = self._frame_engine()
+                if frame_eng is not None:
                     try:
-                        obf_bgr = self.torch_engine.obfuscate_bgr_frame(frame_bgr)
+                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_bgr)
                     except Exception:
                         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                         delta = self._synthesize_delta(rgb, params)
@@ -818,7 +853,7 @@ class ObfuscationService:
                 "fps": round(float(fps), 2),
                 "resolution": [w, h],
                 "processing_time_ms": elapsed_ms,
-                "engine": self.backend_name,
+                "engine": self.video_backend_name,
             }
             return out_bytes, "video/mp4", meta
         finally:
@@ -833,12 +868,13 @@ class ObfuscationService:
         self,
         video_bytes: bytes,
         params: ObfuscationParams,
-        max_frames: int = 24,
+        max_frames: Optional[int] = None,
         frame_step: int = 1,
         max_dimension: int = 640,
     ) -> Dict[str, Any]:
         """Break uploaded video into individual frames, apply ONNX obfuscation model frame-by-frame,
-        and return detailed frame status, before/after base64 images, metrics, and reconstructed video."""
+        and return detailed frame status, before/after base64 images, metrics, and reconstructed video.
+        Every frame is processed (step=1 default); max_frames only caps explicitly when set."""
         import tempfile
         import cv2
 
@@ -873,10 +909,10 @@ class ObfuscationService:
                 out_w = int(orig_w * scale) & ~1
                 out_h = int(orig_h * scale) & ~1
 
-            # If video has more frames than max_frames, auto-sample uniformly across the video
+            # Every frame is processed: honor the caller's step exactly.
+            # (Previously this auto-raised step to fit max_frames, silently
+            # dropping frames from the output video.)
             step = max(1, frame_step)
-            if total_video_frames > max_frames and step == 1:
-                step = max(1, total_video_frames // max_frames)
 
             # Writer FPS must account for subsampling so output duration matches original
             writer_fps = fps / step
@@ -906,10 +942,11 @@ class ObfuscationService:
 
                 t_frame_start = time.perf_counter()
 
-                # Process frame using RealtimeObfuscator (ONNX Runtime or PyTorch)
-                if self.torch_engine is not None:
+                # Process frame using the fast video engine (single-pass ONNX when available)
+                frame_eng = self._frame_engine()
+                if frame_eng is not None:
                     try:
-                        obf_bgr = self.torch_engine.obfuscate_bgr_frame(frame_to_proc)
+                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_to_proc)
                     except Exception:
                         rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
                         delta = self._synthesize_delta(rgb, params)
@@ -965,14 +1002,19 @@ class ObfuscationService:
                 orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
                 obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
 
-                # Synthesize visual perturbation delta map (amplified difference heatmap) for the visualizer
-                diff_amplified = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
-                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_amplified, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                # Perturbation heatmap at thumbnail scale (colormap AFTER downscale:
+                # same visual, far fewer pixels through cvtColor/applyColorMap).
+                diff_thumb_small = diff
                 if thumb_w != out_w or thumb_h != out_h:
-                    diff_thumb = cv2.resize(diff_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    diff_thumb_small = cv2.resize(
+                        np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8),
+                        (thumb_w, thumb_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
                 else:
-                    diff_thumb = diff_bgr
-                _, diff_buf = cv2.imencode(".jpg", diff_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    diff_thumb_small = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
+                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_thumb_small, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                _, diff_buf = cv2.imencode(".jpg", diff_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
 
                 timestamp_sec = round(raw_frame_idx / fps, 2)
@@ -1013,13 +1055,13 @@ class ObfuscationService:
             avg_psnr = round(float(np.mean(psnr_list)) if psnr_list else 0.0, 2)
             avg_ssim = round(float(np.mean(ssim_list)) if ssim_list else 0.0, 4)
 
-            backend_id = "onnx" if (self.torch_engine and self.torch_engine.backend == "onnx") else "torch"
+            backend_id = self._frame_backend_id()
 
             return {
                 "success": True,
-                "engine": self.backend_name,
+                "engine": self.video_backend_name,
                 "backend": backend_id,
-                "model_name": os.path.basename(self.model_path) if self.model_path else "generator.onnx",
+                "model_name": os.path.basename(self.video_model_path or self.model_path or "generator.onnx"),
                 "video_metadata": {
                     "total_video_frames": total_video_frames,
                     "processed_frames_count": processed_count,
@@ -1052,11 +1094,12 @@ class ObfuscationService:
         self,
         video_bytes: bytes,
         params: ObfuscationParams,
-        max_frames: int = 24,
+        max_frames: Optional[int] = None,
         frame_step: int = 1,
         max_dimension: int = 640,
     ):
-        """Generator yielding SSE events as each frame is extracted and obfuscated via ONNX model."""
+        """Generator yielding SSE events as each frame is extracted and obfuscated via ONNX model.
+        Every frame is processed; max_frames only caps explicitly when set."""
         import tempfile
         import cv2
         import json
@@ -1093,21 +1136,20 @@ class ObfuscationService:
                 out_w = int(orig_w * scale) & ~1
                 out_h = int(orig_h * scale) & ~1
 
-            # Auto-sample step if video exceeds max_frames
+            # Every frame is processed: honor the caller's step exactly.
             step = max(1, frame_step)
-            if total_video_frames > max_frames and step == 1:
-                step = max(1, total_video_frames // max_frames)
 
             # Writer FPS must account for subsampling so output duration matches original
             writer_fps = fps / step
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(tmp_out_path, fourcc, writer_fps, (out_w, out_h))
 
-            frames_to_process = min(max_frames, max(1, total_video_frames // step))
-            backend_id = "onnx" if (self.torch_engine and self.torch_engine.backend == "onnx") else "torch"
+            expected = max(1, math.ceil(max(total_video_frames, 0) / step)) if total_video_frames > 0 else 0
+            frames_to_process = min(max_frames, expected) if max_frames else expected
+            backend_id = self._frame_backend_id()
 
             # Initial status event
-            yield f"data: {json.dumps({'type': 'init', 'metadata': {'total_video_frames': total_video_frames, 'frames_to_process': frames_to_process, 'fps': round(float(fps), 2), 'duration_sec': round(float(total_video_frames / max(1.0, fps)), 2), 'width': orig_w, 'height': orig_h, 'engine': self.backend_name, 'backend': backend_id}})}\n\n"
+            yield f"data: {json.dumps({'type': 'init', 'metadata': {'total_video_frames': total_video_frames, 'frames_to_process': frames_to_process, 'fps': round(float(fps), 2), 'duration_sec': round(float(total_video_frames / max(1.0, fps)), 2), 'width': orig_w, 'height': orig_h, 'engine': self.video_backend_name, 'backend': backend_id}})}\n\n"
 
             frames_data = []
             raw_frame_idx = 0
@@ -1132,10 +1174,11 @@ class ObfuscationService:
 
                 t_frame_start = time.perf_counter()
 
-                # Process frame using RealtimeObfuscator (ONNX Runtime)
-                if self.torch_engine is not None:
+                # Process frame using the fast video engine (single-pass ONNX when available)
+                frame_eng = self._frame_engine()
+                if frame_eng is not None:
                     try:
-                        obf_bgr = self.torch_engine.obfuscate_bgr_frame(frame_to_proc)
+                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_to_proc)
                     except Exception:
                         rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
                         delta = self._synthesize_delta(rgb, params)
@@ -1188,13 +1231,18 @@ class ObfuscationService:
                 orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
                 obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
 
-                diff_amplified = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
-                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_amplified, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                # Perturbation heatmap at thumbnail scale (colormap AFTER downscale:
+                # same visual, far fewer pixels through cvtColor/applyColorMap).
                 if thumb_w != out_w or thumb_h != out_h:
-                    diff_thumb = cv2.resize(diff_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    diff_thumb_small = cv2.resize(
+                        np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8),
+                        (thumb_w, thumb_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
                 else:
-                    diff_thumb = diff_bgr
-                _, diff_buf = cv2.imencode(".jpg", diff_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    diff_thumb_small = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
+                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_thumb_small, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                _, diff_buf = cv2.imencode(".jpg", diff_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
 
                 timestamp_sec = round(raw_frame_idx / fps, 2)
@@ -1243,9 +1291,9 @@ class ObfuscationService:
                 "type": "complete",
                 "result": {
                     "success": True,
-                    "engine": self.backend_name,
+                    "engine": self.video_backend_name,
                     "backend": backend_id,
-                    "model_name": os.path.basename(self.model_path) if self.model_path else "generator.onnx",
+                    "model_name": os.path.basename(self.video_model_path or self.model_path or "generator.onnx"),
                     "video_metadata": {
                         "total_video_frames": total_video_frames,
                         "processed_frames_count": processed_count,

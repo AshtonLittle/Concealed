@@ -422,50 +422,6 @@ class ModelProbeService:
         surrogate = self._get_siglip_surrogate()
         eval_res = self._run_training_surrogate_eval(surrogate, clean_pil, obf_pil)
 
-<<<<<<< Updated upstream
-        with torch.no_grad():
-            # Contrast the prompt against a neutral anchor in ONE shared text
-            # batch (softmax pair). Raw sigmoid% floors near 0 for every prompt
-            # on this model, and cosine ratios are noise (cosines cluster ~0).
-            texts = [prompt, _SIGLIP_ANCHORS[0]]
-            inp_c = proc(
-                text=texts, images=clean_pil, return_tensors="pt",
-                padding="max_length", truncation=True, max_length=64,
-            )
-            out_c = model(**inp_c)
-            prob_c = float(out_c.logits_per_image[0].softmax(dim=-1)[0].item())
-            clean_emb = out_c.image_embeds / out_c.image_embeds.norm(dim=-1, keepdim=True)
-
-            inp_o = proc(
-                text=texts, images=obf_pil, return_tensors="pt",
-                padding="max_length", truncation=True, max_length=64,
-            )
-            out_o = model(**inp_o)
-            prob_o = float(out_o.logits_per_image[0].softmax(dim=-1)[0].item())
-            obf_emb = out_o.image_embeds / out_o.image_embeds.norm(dim=-1, keepdim=True)
-
-            rep_sim = float((clean_emb * obf_emb).sum().item())
-
-        # Drop measured on prompt-vs-background share, not raw cosine
-        # (SigLIP cosines cluster near 0, so cosine ratios are pure noise).
-        sim_drop_pct = round(max(0.0, (prob_c - prob_o) / max(prob_c, 1e-4)) * 100.0, 1)
-        evasion_pct = round(
-            min(100.0, max(0.0, sim_drop_pct * 0.6 + (1.0 - rep_sim) * 100.0 * 1.5)), 1
-        )
-        dispersion_pct = round(min(99.0, max(0.0, (1.0 - rep_sim) * 110.0)), 1)
-        status = "EVADED" if (evasion_pct > 55.0 or rep_sim < 0.92) else "PARTIAL"
-
-        clean_out = (
-            f"Google SigLIP prompt-vs-background share aligned (p={prob_c:.3f}). "
-            f"Unimpaired multi-head vision attention across native 224x224 patch grid."
-        )
-        obf_out = (
-            f"SigLIP prompt share dropped to {prob_o:.3f} (drop: {sim_drop_pct}%). "
-            f"Internal representation similarity is {rep_sim:.3f}."
-        )
-
-        return clean_out, obf_out, status, evasion_pct, round(prob_c, 3), round(prob_o, 3), sim_drop_pct, dispersion_pct
-=======
         g_cos = eval_res["global_cos_sim"]
         p_cos = eval_res["patch_cos_sim"]
         s_cos = eval_res["salient_patch_cos"]
@@ -488,7 +444,6 @@ class ModelProbeService:
         )
 
         return clean_out, obf_out, status, evasion_pct, round(g_cos, 3), round(p_cos, 3), sim_drop_pct, reid_ev
->>>>>>> Stashed changes
 
     def _probe_dinov2(
         self, clean_pil: Image.Image, obf_pil: Image.Image, prompt: str

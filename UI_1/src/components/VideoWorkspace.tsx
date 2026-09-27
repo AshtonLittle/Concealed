@@ -62,8 +62,8 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
-  // Configuration States
-  const [maxFrames, setMaxFrames] = useState<number>(24);
+  // Configuration States (maxFrames = 0 means ALL frames are processed)
+  const [maxFrames, setMaxFrames] = useState<number>(0);
   const [epsilon, setEpsilon] = useState<number>(budget);
   const [mode, setMode] = useState<string>(propMode === 'RESIDUAL' ? 'canonical_residual' : propMode.toLowerCase());
   const [autoStartOnDrop, setAutoStartOnDrop] = useState<boolean>(true);
@@ -82,7 +82,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [progressPercent, setProgressPercent] = useState<number>(0);
   const [processedCount, setProcessedCount] = useState<number>(0);
-  const [targetCount, setTargetCount] = useState<number>(24);
+  const [targetCount, setTargetCount] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -216,7 +216,10 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
     formData.append('file', file);
     formData.append('epsilon', epsilon.toString());
     formData.append('mode', mode);
-    formData.append('max_frames', maxFrames.toString());
+    // Omit max_frames to process EVERY frame; only send an explicit cap.
+    if (maxFrames > 0) {
+      formData.append('max_frames', maxFrames.toString());
+    }
     formData.append('frame_step', '1');
 
     try {
@@ -513,6 +516,14 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
               <div className="video-screen-option-pill">
                 <span className="option-label">FRAME SAMPLE</span>
                 <div className="option-btn-segmented">
+                  <button
+                    type="button"
+                    className={`opt-chip-btn ${maxFrames === 0 ? 'active' : ''}`}
+                    onClick={() => setMaxFrames(0)}
+                    title="Process every frame of the video"
+                  >
+                    All
+                  </button>
                   {[12, 24, 48].map((count) => (
                     <button
                       key={count}
