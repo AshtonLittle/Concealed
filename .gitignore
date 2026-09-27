@@ -30,6 +30,8 @@ Thumbs.db
 
 #pictures
 *.png
+!UI_1/public/**
+!Frontend/concealed/public/**
 
 # Mockups
 mockups/

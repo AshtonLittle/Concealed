@@ -1,6 +1,6 @@
 import React from 'react';
 import { Branding } from './Branding';
-import { PlaceholderOptions } from './PlaceholderOptions';
+
 
 export const Sidebar: React.FC = () => {
   return (
@@ -10,7 +10,7 @@ export const Sidebar: React.FC = () => {
       {/* Spacer to push lower tweaks section down naturally */}
       <div className="sidebar-spacer" aria-hidden="true" />
 
-      <PlaceholderOptions />
+     
     </aside>
   );
 };

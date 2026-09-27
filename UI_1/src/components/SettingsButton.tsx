@@ -1,5 +1,4 @@
 import React from 'react';
-import { AppleSettingsGearIcon } from './Icons';
 
 interface SettingsButtonProps {
   isOpen: boolean;
@@ -17,7 +16,11 @@ export const SettingsButton: React.FC<SettingsButtonProps> = ({ isOpen, onClick 
       aria-expanded={isOpen}
       title="Application Settings"
     >
-      <AppleSettingsGearIcon size={46} />
+      <img
+        src="/settings.png"
+        alt="Application Settings"
+        className="settings-icon-img"
+      />
     </button>
   );
 };
