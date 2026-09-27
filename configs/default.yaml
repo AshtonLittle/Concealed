@@ -1,0 +1,132 @@
+# Concealed: Amortized Vision Transformer Obfuscation Generator Configuration
+
+generator:
+  # Architecture capacity preset: "tiny" (~0.45M params), "base" (~1.8M params), "large" (~6.2M params)
+  variant: "base"
+  # Maximum L_infinity perturbation bound in [0, 255] pixel scale (e.g., 8.0 -> 8/255 = 0.03137)
+  epsilon_255: 8.0
+  # Perturbation synthesis mode:
+  # - "canonical_residual": Predicts delta at canonical_size (survives downsampling, constant-time latency)
+  # - "native": Predicts delta directly at native input resolution
+  # - "hybrid": Blends global canonical delta + local high-res tile deltas (defeats both global & tile-slicing VLMs)
+  mode: "hybrid"
+  canonical_size: 256
+  tile_size: 384
+  hybrid_global_weight: 0.6
+  # Concentrates perturbation budget into high-frequency textured regions (Weber's Law masking)
+  luminance_texture_masking: true
+  # Embeds an 8x8 2D-DCT frequency filter bank stem using standard ONNX-native Conv2d
+  use_dct_stem: true
+
+surrogates:
+  # Frees each surrogate's intermediate activation graph immediately after its backward pass
+  # while keeping all model weights resident in fast GPU VRAM (0% accuracy change, no PCIe slowdown)
+  sequential_grad_accum: true
+  # Only set cpu_offload: true on small 8GB GPUs (moves model weights between CPU and GPU)
+  cpu_offload: false
+  # Intermediate ViT block / ConvNeXt stage indices to tap for spatial token disruption
+  tap_layers: [-3, -2, -1]
+  # Default Image Obfuscation Ensemble (SigLIP + OpenCLIP DFN-5B + OpenCLIP ConvNeXt-Large + DINOv2 + Qwen-Image-2.1)
+  train_models:
+    - name: "google/siglip-so400m-patch14-384"
+      weight: 1.0
+    - name: "apple/DFN5B-CLIP-ViT-H-14-378"
+      weight: 1.0
+    - name: "laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft"
+      weight: 1.0
+    - name: "facebook/dinov2-large"
+      weight: 1.0
+    - name: "Qwen/Qwen-Image-2.1"
+      weight: 1.0
+
+  # Optional CLI profiles selectable via `--profile <name>`:
+  profiles:
+    # Fast ensemble (~1.1 GB total weights — ideal for quick staging on Snowflake Trial Accounts)
+    fast:
+      cpu_offload: false
+      train_models:
+        - name: "google/siglip-base-patch16-224"
+          weight: 1.0
+        - name: "openai/clip-vit-base-patch16"
+          weight: 1.0
+        - name: "facebook/dinov2-base"
+          weight: 1.0
+    # Heavy 4-model Hub ensemble (SigLIP-SO400M + DFN5B ViT-H/14 + OpenCLIP ConvNeXt-Large + DINOv2-Large)
+    heavy:
+      cpu_offload: false
+      train_models:
+        - name: "google/siglip-so400m-patch14-384"
+          weight: 1.0
+        - name: "apple/DFN5B-CLIP-ViT-H-14-378"
+          weight: 1.0
+        - name: "laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft"
+          weight: 1.0
+        - name: "facebook/dinov2-large"
+          weight: 1.0
+    # Future OCR / Document text obfuscation profile (adds zai-org/GLM-OCR)
+    ocr:
+      cpu_offload: false
+      train_models:
+        - name: "zai-org/GLM-OCR"
+          weight: 2.0
+        - name: "google/siglip-so400m-patch14-384"
+          weight: 1.0
+        - name: "laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft"
+          weight: 1.0
+        - name: "facebook/dinov2-large"
+          weight: 1.0
+
+  # Unseen open-source Vision Transformers held out strictly for black-box transfer evaluation
+  eval_holdout_models:
+    - name: "openai/clip-vit-large-patch14"
+      weight: 1.0
+    - name: "timm/vit_base_patch16_224"
+      weight: 1.0
+
+eot:
+  enabled: true
+  # Differentiable JPEG compression simulation quality range
+  jpeg_prob: 0.8
+  jpeg_quality_min: 60.0
+  jpeg_quality_max: 95.0
+  # Input Diversity (DI-FGSM) random multi-scale resize & pad
+  random_scale_min: 0.75
+  random_scale_max: 1.25
+  # Simulate high-resolution tile cropping used by frontier VLMs (GPT-4o, Qwen2-VL, Qwen-Image)
+  tile_crop_prob: 0.5
+  # Mild color/exposure jitter
+  color_jitter_strength: 0.03
+
+loss:
+  # Multi-layer spatial patch token cosine similarity repulsion weight
+  patch_cosine_weight: 2.5
+  # Global [CLS] / pooled embedding cosine similarity repulsion weight
+  global_cosine_weight: 1.5
+  # Spatial patch feature variance / attention dispersion disruption weight
+  patch_dispersion_weight: 0.5
+  # Target cosine similarity margin (push cosine similarity toward or below this value)
+  cosine_margin: -0.15
+  # Perceptual stealth regularization weights (keeps image visually clean to human eyes)
+  ssim_weight: 1.2
+  low_freq_tv_weight: 2.0
+  l2_reg_weight: 0.2
+  use_lpips: false
+  lpips_weight: 0.5
+
+training:
+  train_resolution: 384
+  batch_size: 4
+  grad_accumulation_steps: 2
+  epochs: 40
+  lr: 2.0e-4
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  warmup_epochs: 2
+  max_grad_norm: 1.0
+  ema_decay: 0.995
+  mixed_precision: "fp16"  # "fp16", "bf16", or "no"
+  val_split: 0.1
+  num_workers: 4
+  save_every_epochs: 5
+  auto_export_onnx: true
+  seed: 42
