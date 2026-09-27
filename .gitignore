@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Deep Learning model weights, caches & checkpoints
 *.pt
 *.onnx
@@ -50,3 +51,42 @@ mockups/
 Thumbs.db
 .vscode/
 .idea/
+=======
+# YOLO and Deep Learning model weights
+# (Ultralytics and OpenCV auto-download these locally on first run)
+*.pt
+*.onnx
+weights/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Generated modified output images
+modified_*
+test_*
+output_*
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+#pictures
+*.png
+!UI_1/public/**
+!Frontend/concealed/public/**
+
+# Mockups
+mockups/
+>>>>>>> Frontend
