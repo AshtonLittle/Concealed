@@ -197,8 +197,16 @@ def build_worker_config(
         role_desc = f"Data Shard {worker_idx + 1}/{num_workers}"
         return cfg, role_desc
 
-    role_title, focus_token = SPECIALIST_ROLES[worker_idx % len(SPECIALIST_ROLES)]
     models = cfg.get("surrogates", {}).get("train_models", [])
+    if len(models) == 1:
+        only_name = str(models[0].get("name", "ViT")).split("/")[-1]
+        base_lr = float(train_cfg.get("lr", 6.0e-4))
+        lr_mults = [1.0, 1.08, 0.94, 1.04]
+        train_cfg["lr"] = round(base_lr * lr_mults[worker_idx % len(lr_mults)], 7)
+        role_desc = f"{only_name} Specialist (Shard {worker_idx + 1}/{num_workers})"
+        return cfg, role_desc
+
+    role_title, focus_token = SPECIALIST_ROLES[worker_idx % len(SPECIALIST_ROLES)]
     for m in models:
         mname = str(m.get("name", "")).lower()
         base_w = float(m.get("weight", 1.0))
@@ -231,10 +239,15 @@ def _stage_has_file(session, stage_file_path: str) -> bool:
 
 
 def _prepare_local_surrogate_tar(config: dict, profile_key: str) -> Path:
-    """Cache surrogate vision towers once locally and pack into a reusable `.tar` archive."""
+    """Cache surrogate vision towers once locally and pack ONLY the active models into a `.tar` archive."""
     cache_dir = Path(".snowflake_hf_cache").resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    bundle_path = cache_dir / f"hf_cache_{profile_key}.tar"
+    model_specs = config.get("surrogates", {}).get("train_models", [])
+    model_names = [str(spec["name"]) for spec in model_specs]
+
+    # Build a unique bundle filename based on the active surrogate model set
+    short_slug = "_".join(sorted(m.split("/")[-1][:14] for m in model_names)) or profile_key
+    bundle_path = cache_dir / f"hf_cache_{short_slug}.tar"
 
     if bundle_path.exists() and bundle_path.stat().st_size > 1024 * 1024:
         return bundle_path
@@ -242,10 +255,8 @@ def _prepare_local_surrogate_tar(config: dict, profile_key: str) -> Path:
     old_hf_home = os.environ.get("HF_HOME")
     os.environ["HF_HOME"] = str(cache_dir)
     try:
-        model_specs = config.get("surrogates", {}).get("train_models", [])
-        print(f"[Prep] Ensuring {len(model_specs)} surrogate vision towers are cached in {cache_dir.name} ...")
-        for spec in model_specs:
-            mname = str(spec["name"])
+        print(f"[Prep] Ensuring {len(model_names)} surrogate vision tower(s) are cached in {cache_dir.name} ...")
+        for mname in model_names:
             print(f"  -> Verifying vision tower: {mname}")
             _ = VisionTransformerSurrogate(model_name=mname, weight=1.0, pretrained=True)
     finally:
@@ -254,11 +265,19 @@ def _prepare_local_surrogate_tar(config: dict, profile_key: str) -> Path:
         else:
             os.environ["HF_HOME"] = old_hf_home
 
-    print(f"[Prep] Packing shared surrogate weights archive {bundle_path.name} ...")
+    # Only include HF hub directories matching the active surrogates so single-model runs stay compact
+    allowed_dir_tokens = [m.replace("/", "--").lower() for m in model_names] + [
+        m.split("/")[-1].lower() for m in model_names
+    ]
+
+    print(f"[Prep] Packing surrogate weights archive {bundle_path.name} ...")
     with tarfile.open(bundle_path, "w") as tar:
         for item in cache_dir.rglob("*"):
             if item.is_file() and not item.name.endswith(".lock") and not item.name.endswith(".tar"):
                 rel = item.relative_to(cache_dir).as_posix()
+                rel_lower = rel.lower()
+                if "models--" in rel_lower and not any(tok in rel_lower for tok in allowed_dir_tokens):
+                    continue
                 tar.add(str(item), arcname=rel)
     return bundle_path
 
