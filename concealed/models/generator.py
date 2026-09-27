@@ -193,7 +193,7 @@ class WeberTextureMask(nn.Module):
     perturbations while textured regions use the full epsilon budget.
     """
 
-    def __init__(self, min_mask_scale: float = 0.14) -> None:
+    def __init__(self, min_mask_scale: float = 0.05) -> None:
         super().__init__()
         self.min_mask_scale = min_mask_scale
         sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]) / 8.0
@@ -202,15 +202,16 @@ class WeberTextureMask(nn.Module):
         self.register_buffer("sobel_kernels", kernels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Convert RGB [B, 3, H, W] to luminance [B, 1, H, W]
         lum = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
         grads = F.conv2d(F.pad(lum, (1, 1, 1, 1), mode="reflect"), self.sobel_kernels)
-        mag = torch.sqrt(grads[:, 0:1] ** 2 + grads[:, 1:2] ** 2 + 1e-6)
-        # Smooth local texture energy over a 5x5 neighborhood
+        mag = torch.sqrt(grads[:, 0:1] ** 2 + grads[:, 1:2] ** 2 + 1e-8)
+        # Tight 5x5 native-resolution pooling (2px radius at 720p) avoids halo bleed onto smooth skin
         energy = F.avg_pool2d(mag, kernel_size=5, stride=1, padding=2)
-        normalized = torch.tanh(energy * 12.0)
-        mask = self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
-        return mask
+        mean_e = energy.mean(dim=(-2, -1), keepdim=True).clamp(min=0.004)
+        # Dead-zone below 0.55 * mean_e keeps flat walls & smooth foreheads/cheeks completely untouched
+        above_smooth = F.relu((energy / mean_e) - 0.55)
+        normalized = torch.tanh(above_smooth * 1.4)
+        return self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
 
 
 class AmortizedObfuscationGenerator(nn.Module):
@@ -356,13 +357,17 @@ class AmortizedObfuscationGenerator(nn.Module):
 
         raw = self.head(d1)
 
-        # 1. High-pass spatial filter: strip low-frequency (>9px) wavy blobs while preserving
-        # intra-patch (2px-8px) frequencies that resonate with 14x14 and 16x16 ViT patch kernels.
-        raw = raw - F.avg_pool2d(raw, kernel_size=9, stride=1, padding=4)
+        # 1. Smooth B-spline high-pass spatial filter (3 iterated 5x5 passes = smooth Gaussian-like kernel,
+        # eliminating sharp 9x9 box-filter Gibbs ringing lines while stripping >9px blobs)
+        low_pass = raw
+        for _ in range(3):
+            low_pass = F.avg_pool2d(low_pass, kernel_size=5, stride=1, padding=2)
+        raw = raw - low_pass
 
         # 2. Content-adaptive structural gate: tie perturbation phase/amplitude to input structure
         # so the generator cannot collapse to a static image-independent background grating.
-        x_hp = (x - F.avg_pool2d(x, kernel_size=7, stride=1, padding=3)).abs().mean(dim=1, keepdim=True)
+        x_lp = F.avg_pool2d(F.avg_pool2d(x, kernel_size=5, stride=1, padding=2), kernel_size=5, stride=1, padding=2)
+        x_hp = (x - x_lp).abs().mean(dim=1, keepdim=True)
         content_gate = 0.65 + 0.70 * torch.tanh(x_hp * 16.0)
         return raw * content_gate
 
