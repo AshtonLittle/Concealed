@@ -18,7 +18,7 @@ import io
 import math
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -426,14 +426,17 @@ class ObfuscationService:
         prompt: str = "Describe the content of the image.",
         model_ids: Optional[List[str]] = None,
         model_engine: Optional[str] = None,
+        epsilon: float = 8.0,
     ) -> Any:
         """Run full evaluation comparing Clean vs Concealed perception across Vision Transformers."""
+        eps = float(epsilon) if epsilon is not None else 8.0
         return self.probe_service.probe_image(
             clean_image_bytes=clean_image_bytes,
             obfuscated_image_bytes=obfuscated_image_bytes,
             prompt=prompt,
             model_ids=model_ids,
-            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine),
+            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine, epsilon=eps),
+            obfuscation_epsilon=eps,
         )
 
     def probe_options_siglip(
@@ -442,13 +445,16 @@ class ObfuscationService:
         obfuscated_image_bytes: Optional[bytes] = None,
         options: Optional[List[str]] = None,
         model_engine: Optional[str] = None,
+        epsilon: float = 8.0,
     ) -> Any:
         """Run real Google SigLIP confidence evaluation on user-provided options."""
+        eps = float(epsilon) if epsilon is not None else 8.0
         return self.probe_service.probe_options_siglip(
             clean_image_bytes=clean_image_bytes,
             obfuscated_image_bytes=obfuscated_image_bytes,
             options=options,
-            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine),
+            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine, epsilon=eps),
+            obfuscation_epsilon=eps,
         )
 
     def _synthesize_delta(
