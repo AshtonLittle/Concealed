@@ -847,8 +847,15 @@ class ObfuscationService:
                 out_w = int(orig_w * scale) & ~1
                 out_h = int(orig_h * scale) & ~1
 
+            # If video has more frames than max_frames, auto-sample uniformly across the video
+            step = max(1, frame_step)
+            if total_video_frames > max_frames and step == 1:
+                step = max(1, total_video_frames // max_frames)
+
+            # Writer FPS must account for subsampling so output duration matches original
+            writer_fps = fps / step
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(tmp_out_path, fourcc, fps, (out_w, out_h))
+            writer = cv2.VideoWriter(tmp_out_path, fourcc, writer_fps, (out_w, out_h))
 
             frames_data = []
             raw_frame_idx = 0
@@ -856,11 +863,6 @@ class ObfuscationService:
             frame_latencies = []
             psnr_list = []
             ssim_list = []
-
-            # If video has more frames than max_frames, auto-sample uniformly across the video
-            step = max(1, frame_step)
-            if total_video_frames > max_frames and step == 1:
-                step = max(1, total_video_frames // max_frames)
 
             while True:
                 ret, frame_bgr = cap.read()
@@ -1065,13 +1067,15 @@ class ObfuscationService:
                 out_w = int(orig_w * scale) & ~1
                 out_h = int(orig_h * scale) & ~1
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(tmp_out_path, fourcc, fps, (out_w, out_h))
-
             # Auto-sample step if video exceeds max_frames
             step = max(1, frame_step)
             if total_video_frames > max_frames and step == 1:
                 step = max(1, total_video_frames // max_frames)
+
+            # Writer FPS must account for subsampling so output duration matches original
+            writer_fps = fps / step
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(tmp_out_path, fourcc, writer_fps, (out_w, out_h))
 
             frames_to_process = min(max_frames, max(1, total_video_frames // step))
             backend_id = "onnx" if (self.torch_engine and self.torch_engine.backend == "onnx") else "torch"

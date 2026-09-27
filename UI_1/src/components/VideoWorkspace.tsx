@@ -75,17 +75,72 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
   const originalVideoRef = useRef<HTMLVideoElement>(null);
   const concealedVideoRef = useRef<HTMLVideoElement>(null);
 
-  // Clean up object URLs
+  // Clean up object URLs — separated so revoking one doesn't invalidate the other
   useEffect(() => {
     return () => {
       if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
+    };
+  }, [videoPreviewUrl]);
+
+  useEffect(() => {
+    return () => {
       if (concealedVideoUrl && concealedVideoUrl.startsWith('blob:')) {
         URL.revokeObjectURL(concealedVideoUrl);
       }
     };
-  }, [videoPreviewUrl, concealedVideoUrl]);
+  }, [concealedVideoUrl]);
 
-  // Synchronize playback when in side-by-side mode
+  const hasResults = Boolean((concealedVideoUrl || frames.length > 0) && !isProcessing);
+
+  // Continuous frame-accurate sync between original and concealed in side-by-side mode
+  const syncRafRef = useRef<number | null>(null);
+
+  const startSync = useCallback(() => {
+    const tick = () => {
+      const orig = originalVideoRef.current;
+      const conc = concealedVideoRef.current;
+      if (orig && conc) {
+        // Match playback rate
+        if (conc.playbackRate !== orig.playbackRate) {
+          conc.playbackRate = orig.playbackRate;
+        }
+        // Keep currentTime within 0.1s tolerance to avoid constant micro-seeks
+        const drift = Math.abs(orig.currentTime - conc.currentTime);
+        if (drift > 0.1) {
+          conc.currentTime = orig.currentTime;
+        }
+        // Mirror play/pause state
+        if (!orig.paused && conc.paused) {
+          conc.play().catch(() => {});
+        } else if (orig.paused && !conc.paused) {
+          conc.pause();
+        }
+      }
+      syncRafRef.current = requestAnimationFrame(tick);
+    };
+    // Cancel any existing loop before starting a new one
+    if (syncRafRef.current) cancelAnimationFrame(syncRafRef.current);
+    syncRafRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  const stopSync = useCallback(() => {
+    if (syncRafRef.current) {
+      cancelAnimationFrame(syncRafRef.current);
+      syncRafRef.current = null;
+    }
+  }, []);
+
+  // Start/stop the sync loop when entering/leaving side-by-side mode
+  useEffect(() => {
+    if (activeVideoTab === 'side-by-side' && hasResults) {
+      startSync();
+    } else {
+      stopSync();
+    }
+    return () => stopSync();
+  }, [activeVideoTab, hasResults, startSync, stopSync]);
+
+  // Legacy event handlers kept as immediate-response fallbacks for side-by-side
   const handleOriginalPlay = () => {
     if (activeVideoTab === 'side-by-side' && concealedVideoRef.current && concealedVideoRef.current.paused) {
       concealedVideoRef.current.play().catch(() => {});
@@ -327,7 +382,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
     document.body.removeChild(a);
   };
 
-  const hasResults = Boolean((concealedVideoUrl || frames.length > 0) && !isProcessing);
+
 
   return (
     <main className="video-workspace-screen-wrapper" aria-label="Video protection workspace">
@@ -713,6 +768,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
                         controls
                         autoPlay
                         loop
+                        muted
                         className="cinema-video-element dual"
                       />
                     ) : (
@@ -722,6 +778,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
                         controls
                         autoPlay
                         loop
+                        muted
                         className="cinema-video-element dual"
                       />
                     )}
