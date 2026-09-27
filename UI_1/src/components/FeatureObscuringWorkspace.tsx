@@ -163,17 +163,7 @@ export const FeatureObscuringWorkspace: React.FC = () => {
       <div className="workspace-content feature-obscuring-content">
         
         {/* Workspace Title & Disclaimer Banner */}
-        <div className="feature-obscuring-header">
-          <div className="feature-disclaimer-card">
-            <div className="feature-disclaimer-top">
-              <span className="feature-disclaimer-pill">TARGETED PRIVACY NOTICE</span>
-              <h2 className="feature-header-title">Targeted Feature Obscuring</h2>
-            </div>
-            <p className="feature-header-subtitle">
-              Detects and isolates specific visual features (such as <strong>faces</strong>, <strong>people</strong>, <strong>text</strong>, or <strong>objects</strong>) conforming strictly to silhouette contours using neural vision models, applying localized AI privacy protection while preserving the surrounding image untouched.
-            </p>
-          </div>
-        </div>
+      
 
         <div className="feature-obscuring-grid">
           {/* Left Column: Image Selection & Feature Controls */}
