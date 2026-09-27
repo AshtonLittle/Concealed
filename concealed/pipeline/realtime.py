@@ -255,15 +255,19 @@ class RealtimeObfuscator:
 
         h, w = x_c.shape[-2], x_c.shape[-1]
         with torch.no_grad():
-            # Evaluate texture mask at native resolution so eye/mouth gradients do not blur onto smooth cheeks
-            tex_mask = weber(x_c)
+            # Evaluate texture + shadow mask at canonical 384x384 so it is 100% scale-invariant across 720p and 20MP+
+            x_384_clean = F.interpolate(x_c, size=(384, 384), mode="bilinear", align_corners=False)
+            lum_384 = 0.299 * x_384_clean[:, 0:1] + 0.587 * x_384_clean[:, 1:2] + 0.114 * x_384_clean[:, 2:3]
+            shadow_gate_384 = (lum_384 / 0.08).clamp(0.35, 1.0)
+            tex_mask_384 = weber(x_384_clean) * shadow_gate_384
 
-            clean_targets = [m(x_c) for m in models]
+            # Exact 224x224 clean image as seen by VisionTransformerSurrogate.preprocess(x_c)
+            x_224_clean = F.interpolate(x_c, size=(224, 224), mode="bilinear", align_corners=False)
+            clean_targets = [m(x_224_clean) for m in models]
+
             if self.generator is not None:
-                x_224 = F.interpolate(x_c, size=(224, 224), mode="bilinear", align_corners=False)
-                x_384 = F.interpolate(x_c, size=(384, 384), mode="bilinear", align_corners=False)
-                raw_init_224 = (0.25 * torch.tanh(self.generator._forward_padded(x_224))).detach().clone()
-                raw_init_384 = (0.25 * torch.tanh(self.generator._forward_padded(x_384))).detach().clone()
+                raw_init_224 = (0.25 * torch.tanh(self.generator._forward_padded(x_224_clean))).detach().clone()
+                raw_init_384 = (0.25 * torch.tanh(self.generator._forward_padded(x_384_clean))).detach().clone()
             else:
                 init_delta = (x_0 - x_c).clamp(-eps * 0.99, eps * 0.99)
                 init_224 = F.interpolate(init_delta, size=(224, 224), mode="bilinear", align_corners=False)
@@ -281,7 +285,7 @@ class RealtimeObfuscator:
                 lp = F.avg_pool2d(lp, kernel_size=5, stride=1, padding=2)
             return z - lp
 
-        def _synthesize_delta() -> torch.Tensor:
+        def _synthesize_delta_384() -> torch.Tensor:
             hp_224 = _smooth_hp(param_224)
             hp_384 = _smooth_hp(param_384)
             # Local RMS wave normalization at 224/384 prevents tanh saturation plateaus & contour lines!
@@ -290,25 +294,23 @@ class RealtimeObfuscator:
             norm_224 = hp_224 / rms_224
             norm_384 = hp_384 / rms_384
 
-            up_224 = F.interpolate(norm_224, size=(h, w), mode="bicubic", align_corners=False)
-            up_384 = F.interpolate(norm_384, size=(h, w), mode="bicubic", align_corners=False)
-            raw = 0.60 * up_224 + 0.40 * up_384
-            # Gentle native-resolution smoothing eliminates any residual interpolation ridges
-            raw = F.avg_pool2d(raw, kernel_size=5, stride=1, padding=2)
+            up_224 = F.interpolate(norm_224, size=(384, 384), mode="bicubic", align_corners=False)
+            raw = 0.65 * up_224 + 0.35 * norm_384
 
-            # Subtle cap (L_inf <= 5/255 on textures, ~1.2/255 on smooth skin/walls -> PSNR ~ 45+ dB)
+            # Subtle cap (L_inf <= 5.5/255 on textures, ~1.5/255 on smooth skin/walls -> PSNR ~ 44-45 dB)
             soft_cap = min(eps, 5.5 / 255.0)
-            d = soft_cap * torch.tanh(raw * 0.65)
+            d = soft_cap * torch.tanh(raw * 0.68)
             # YCbCr chrominance damping (85% pure luminance so there is zero color tint)
             d_y = 0.299 * d[:, 0:1] + 0.587 * d[:, 1:2] + 0.114 * d[:, 2:3]
-            d = (d_y + 0.15 * (d - d_y)) * tex_mask
+            d = (d_y + 0.15 * (d - d_y)) * tex_mask_384
             return torch.clamp(d, -soft_cap, soft_cap)
 
         print(f"\n--- Running Hybrid Smooth ViT Refinement ({steps} steps, eps={eps * 255:.1f}/255) ---", flush=True)
         for step in range(1, steps + 1):
             opt.zero_grad()
-            delta = _synthesize_delta()
-            x_adv = torch.clamp(x_c + delta, 0.0, 1.0)
+            delta_384 = _synthesize_delta_384()
+            delta_224 = F.interpolate(delta_384, size=(224, 224), mode="bilinear", align_corners=False)
+            x_adv = torch.clamp(x_224_clean + delta_224, 0.0, 1.0)
 
             total_loss = torch.tensor(0.0, device=dev)
             p_cos_list = []
@@ -352,7 +354,10 @@ class RealtimeObfuscator:
                 )
 
         with torch.no_grad():
-            delta = _synthesize_delta()
+            delta_384 = _synthesize_delta_384()
+            delta = F.interpolate(delta_384, size=(h, w), mode="bicubic", align_corners=False)
+            soft_cap = min(eps, 5.5 / 255.0)
+            delta = torch.clamp(delta, -soft_cap, soft_cap)
             x_final = torch.clamp(x_c + delta, 0.0, 1.0).to(x_clean.device)
 
         return x_final.squeeze(0) if squeeze else x_final
@@ -366,6 +371,7 @@ class RealtimeObfuscator:
     ) -> Dict[str, object]:
         """Compute and print a comprehensive ViT Feature Identification & Visual Stealth Analytics report."""
         import math
+        import torch.nn.functional as F
         from concealed.losses.obfuscation_loss import compute_ssim_loss
         from concealed.models.surrogates import VisionTransformerSurrogate
 
@@ -377,7 +383,17 @@ class RealtimeObfuscator:
 
         mse = float(delta.pow(2).mean().item())
         psnr_db = 10.0 * math.log10(1.0 / max(mse, 1e-10))
-        ssim_val = 1.0 - float(compute_ssim_loss(x_c, x_o).item())
+        if max(x_c.shape[-2], x_c.shape[-1]) > 1280:
+            s_scale = 1280.0 / float(max(x_c.shape[-2], x_c.shape[-1]))
+            sh, sw = int(round(x_c.shape[-2] * s_scale)), int(round(x_c.shape[-1] * s_scale))
+            ssim_val = 1.0 - float(
+                compute_ssim_loss(
+                    F.interpolate(x_c, size=(sh, sw), mode="bilinear", align_corners=False),
+                    F.interpolate(x_o, size=(sh, sw), mode="bilinear", align_corners=False),
+                ).item()
+            )
+        else:
+            ssim_val = 1.0 - float(compute_ssim_loss(x_c, x_o).item())
         linf_255 = float(delta.abs().max().item() * 255.0)
         rmse_255 = float(math.sqrt(mse) * 255.0)
         delta_y = 0.299 * delta[:, 0:1] + 0.587 * delta[:, 1:2] + 0.114 * delta[:, 2:3]
@@ -566,8 +582,14 @@ def main() -> None:
             print(f"Obfuscated image -> {out_path}")
 
             if args.save_comparison:
-                clean_f = np.asarray(clean_pil, dtype=np.float32) / 255.0
-                obf_f = np.asarray(obf_pil, dtype=np.float32) / 255.0
+                c_vis, o_vis = clean_pil, obf_pil
+                if max(c_vis.size) > 1400:
+                    vis_scale = 1400.0 / float(max(c_vis.size))
+                    vw, vh = int(round(c_vis.width * vis_scale)), int(round(c_vis.height * vis_scale))
+                    c_vis = c_vis.resize((vw, vh), Image.Resampling.BICUBIC)
+                    o_vis = o_vis.resize((vw, vh), Image.Resampling.BICUBIC)
+                clean_f = np.asarray(c_vis, dtype=np.float32) / 255.0
+                obf_f = np.asarray(o_vis, dtype=np.float32) / 255.0
                 diff_10x = np.clip(np.abs(obf_f - clean_f) * 10.0, 0.0, 1.0)
                 comp = np.concatenate([clean_f, obf_f, diff_10x], axis=1)
                 comp_path = out_path.with_name(f"{out_path.stem}_comparison.png")

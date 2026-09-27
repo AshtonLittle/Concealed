@@ -202,15 +202,25 @@ class WeberTextureMask(nn.Module):
         self.register_buffer("sobel_kernels", kernels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lum = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+        h, w = x.shape[-2], x.shape[-1]
+        if h > 1024 or w > 1024:
+            scale = 1024.0 / float(max(h, w))
+            mh, mw = max(16, int(round(h * scale))), max(16, int(round(w * scale)))
+            x_in = F.interpolate(x, size=(mh, mw), mode="bilinear", align_corners=False)
+        else:
+            x_in = x
+        lum = 0.299 * x_in[:, 0:1] + 0.587 * x_in[:, 1:2] + 0.114 * x_in[:, 2:3]
         grads = F.conv2d(F.pad(lum, (1, 1, 1, 1), mode="reflect"), self.sobel_kernels)
         mag = torch.sqrt(grads[:, 0:1] ** 2 + grads[:, 1:2] ** 2 + 1e-8)
-        # Native-resolution 7x7 smoothing keeps smooth cheeks/foreheads at min_mask_scale without 180px halo bleed
+        # 7x7 smoothing keeps smooth cheeks/foreheads at min_mask_scale without halo bleed
         energy = F.avg_pool2d(F.avg_pool2d(mag, kernel_size=7, stride=1, padding=3), kernel_size=7, stride=1, padding=3)
         mean_e = energy.mean(dim=(-2, -1), keepdim=True).clamp(min=0.004)
         above_flat = F.relu((energy / mean_e) - 0.55)
         normalized = torch.tanh(above_flat * 1.35)
-        return self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
+        mask = self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
+        if mask.shape[-2:] != (h, w):
+            mask = F.interpolate(mask, size=(h, w), mode="bilinear", align_corners=False)
+        return mask
 
 
 class AmortizedObfuscationGenerator(nn.Module):
@@ -373,6 +383,13 @@ class AmortizedObfuscationGenerator(nn.Module):
     def _forward_padded(self, x: torch.Tensor) -> torch.Tensor:
         """Pad input to a multiple of 8, run backbone, and crop back to exact (H, W)."""
         _, _, h, w = x.shape
+        if h > 768 or w > 768:
+            scale = 768.0 / float(max(h, w))
+            bh = max(16, (int(round(h * scale)) // 8) * 8)
+            bw = max(16, (int(round(w * scale)) // 8) * 8)
+            x_scaled = F.interpolate(x, size=(bh, bw), mode="bilinear", align_corners=False)
+            raw_scaled = self._forward_backbone(x_scaled)
+            return F.interpolate(raw_scaled, size=(h, w), mode="bilinear", align_corners=False)
         pad_h = (8 - (h % 8)) % 8
         pad_w = (8 - (w % 8)) % 8
         if pad_h > 0 or pad_w > 0:
