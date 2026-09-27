@@ -132,7 +132,7 @@ def main() -> None:
                 epsilon_255=args.epsilon,
             )
         else:
-            gen = AmortizedObfuscationGenerator(epsilon=args.epsilon / 255.0)
+            gen = AmortizedObfuscationGenerator(epsilon_255=args.epsilon)
             obfuscator = RealtimeObfuscator(
                 model_path=gen,
                 device=args.device or "cpu",
