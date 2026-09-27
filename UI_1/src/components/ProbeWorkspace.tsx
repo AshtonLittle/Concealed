@@ -2,12 +2,18 @@ import React, { useState, useRef } from 'react';
 import type { SiglipOptionScore, SiglipProbeResponse } from '../types/probe';
 
 interface ProbeWorkspaceProps {
-  selectedModelEngine?: string;
+  selectedModelEngine?: 'onnx' | 'pt';
+  budget?: number;
+  mode?: string;
 }
 
 const DEFAULT_OPTIONS = ['face', 'person', 'readable text', 'dog', 'car'];
 
-export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({ selectedModelEngine = 'onnx' }) => {
+export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({
+  selectedModelEngine = 'onnx',
+  budget = 8,
+  mode = 'HYBRID',
+}) => {
   // Image state
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
@@ -111,6 +117,8 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({ selectedModelEng
       formData.append('file', imageFile);
       formData.append('options', options.join(', '));
       formData.append('model_engine', selectedModelEngine);
+      formData.append('epsilon', String(budget));
+      formData.append('mode', mode);
 
       const res = await fetch('http://127.0.0.1:8001/api/probe/siglip', {
         method: 'POST',
@@ -178,9 +186,17 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({ selectedModelEng
             Test what Google SigLIP detects before and after Concealed protection for your options.
           </p>
         </div>
-        <div className="siglip-engine-tag">
-          <span className="siglip-model-label">Model:</span>
-          <strong>google/siglip-base-patch16-224</strong>
+        <div className="siglip-header-tags-group">
+          <div className="siglip-engine-tag">
+            <span className="siglip-model-label">Probe:</span>
+            <strong>google/siglip-base-patch16-224</strong>
+          </div>
+          <div className="siglip-engine-tag params-tag">
+            <span className="siglip-model-label">Concealing Params:</span>
+            <strong>
+              {selectedModelEngine === 'onnx' ? 'ONNX' : 'PyTorch'} • ε={budget} • {mode}
+            </strong>
+          </div>
         </div>
       </div>
 

@@ -72,6 +72,8 @@ async def probe_transformer_models(
     prompt: str = Form("Describe the content of the image.", description="Query prompt for the Vision Transformers"),
     models: Optional[str] = Form(None, description="Comma-separated model IDs to probe, or 'all'"),
     model_engine: Optional[str] = Form("onnx", description="Model engine used if auto-generating obfuscated counterpart"),
+    epsilon: float = Form(8.0, ge=0.5, le=64.0, description="Epsilon budget used when auto-generating the concealed image"),
+    mode: Optional[str] = Form("HYBRID", description="Protection mode (HYBRID, CANONICAL, NATIVE)"),
 ) -> ProbeResponse:
     """Probe Vision Transformers and VLMs with a text prompt on Clean vs Concealed image."""
     try:
@@ -97,6 +99,8 @@ async def probe_transformer_models(
             prompt=prompt,
             model_ids=model_id_list,
             model_engine=model_engine,
+            epsilon=epsilon,
+            mode=mode,
         )
         return res
     except Exception as e:
@@ -112,6 +116,8 @@ async def probe_siglip_options(
     obfuscated_file: Optional[UploadFile] = File(None, description="Optional pre-obfuscated image file"),
     options: str = Form("face, person, readable text, dog, car", description="Comma-separated or JSON list of options to test"),
     model_engine: Optional[str] = Form("onnx", description="Model engine used if auto-generating obfuscated counterpart"),
+    epsilon: float = Form(8.0, ge=0.5, le=64.0, description="Epsilon budget used when auto-generating the concealed image"),
+    mode: Optional[str] = Form("HYBRID", description="Protection mode (HYBRID, CANONICAL, NATIVE)"),
 ) -> SiglipProbeResponse:
     """Probe user options with real Google SigLIP comparing Clean vs Concealed image."""
     try:
@@ -149,6 +155,8 @@ async def probe_siglip_options(
             obfuscated_image_bytes=obf_bytes,
             options=opts_list,
             model_engine=model_engine,
+            epsilon=epsilon,
+            mode=mode,
         )
         return res
     except Exception as e:
@@ -350,7 +358,7 @@ async def obfuscate_image_upload(
             "X-SSIM": str(analytics.ssim),
             "X-Linf-255": str(analytics.linf_255),
             "X-Output-Format": ext.upper(),
-            "X-Model": getattr(service, "model_filename", "best_generator.pt"),
+            "X-Model": getattr(service, "last_engine_filename", ("generator.onnx" if params.model_engine == "onnx" else "best_generator.pt")),
             "X-Quality-Loss-Pct": str(analytics.quality_loss_pct),
         }
         return Response(content=out_bytes, media_type=mime_type, headers=headers)

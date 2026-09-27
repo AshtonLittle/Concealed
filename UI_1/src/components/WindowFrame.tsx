@@ -21,7 +21,8 @@ export const WindowFrame: React.FC<WindowFrameProps> = ({
   isSettingsOpen = true,
   onToggleSettings,
 }) => {
-  const isNoSidebarView = currentView === 'feature-obscuring' || currentView === 'probe';
+  const isStatisticsHidden = currentView === 'feature-obscuring' || currentView === 'probe';
+  const isSettingsHidden = currentView === 'feature-obscuring';
 
   return (
     <div className="window-viewport">
@@ -39,7 +40,7 @@ export const WindowFrame: React.FC<WindowFrameProps> = ({
         {/* Window Body (Left Statistics + Middle Workspace + Right Settings) */}
         <div className="window-body">
           {/* Left Dock Button (Expand Statistics) */}
-          {!isNoSidebarView && !isSidebarOpen && onToggleSidebar && (
+          {!isStatisticsHidden && !isSidebarOpen && onToggleSidebar && (
             <button
               type="button"
               className="sidebar-dock-expand-btn"
@@ -68,7 +69,7 @@ export const WindowFrame: React.FC<WindowFrameProps> = ({
           {children}
 
           {/* Right Dock Button (Expand Settings) */}
-          {!isNoSidebarView && !isSettingsOpen && onToggleSettings && (
+          {!isSettingsHidden && !isSettingsOpen && onToggleSettings && (
             <button
               type="button"
               className="settings-dock-expand-btn"

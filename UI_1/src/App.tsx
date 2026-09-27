@@ -22,14 +22,22 @@ export function App() {
   const [videoFormat, setVideoFormat] = useState<VideoOutputFormat>('MP4');
   const [concealStats, setConcealStats] = useState<ConcealStats | null>(null);
 
-  const isNoSidebarView = currentView === 'feature-obscuring' || currentView === 'probe';
+  const isStatisticsHidden = currentView === 'feature-obscuring' || currentView === 'probe';
+  const isSettingsHidden = currentView === 'feature-obscuring';
 
   // When switching to video view, collapse settings and sidebar so video fits majority of screen
+  // When switching to probe view, keep statistics hidden and display only concealing parameters (settings)
   useEffect(() => {
     if (currentView === 'video') {
       setIsSettingsOpen(false);
       setIsSidebarOpen(false);
-    } else if (currentView !== 'feature-obscuring' && currentView !== 'probe') {
+    } else if (currentView === 'feature-obscuring') {
+      setIsSidebarOpen(false);
+      setIsSettingsOpen(false);
+    } else if (currentView === 'probe') {
+      setIsSidebarOpen(false);
+      setIsSettingsOpen(true);
+    } else {
       setIsSidebarOpen(true);
       setIsSettingsOpen(true);
     }
@@ -59,7 +67,7 @@ export function App() {
       onToggleSettings={() => setIsSettingsOpen((prev) => !prev)}
     >
       {/* Left Column: Statistics (hidden for feature obscuring and model probe) */}
-      {!isNoSidebarView && (
+      {!isStatisticsHidden && (
         <Sidebar
           isOpen={isSidebarOpen}
           onToggle={() => setIsSidebarOpen((prev) => !prev)}
@@ -90,10 +98,16 @@ export function App() {
           onStatsUpdate={setConcealStats}
         />
       )}
-      {currentView === 'probe' && <ProbeWorkspace selectedModelEngine={selectedImageModel} />}
+      {currentView === 'probe' && (
+        <ProbeWorkspace
+          selectedModelEngine={selectedImageModel}
+          budget={budget}
+          mode={mode}
+        />
+      )}
 
-      {/* Right Column: Settings (hidden for feature obscuring and model probe) */}
-      {!isNoSidebarView && (
+      {/* Right Column: Settings / Concealing Parameters (available in image, video, and model probe) */}
+      {!isSettingsHidden && (
         <SettingsSidebar
           isOpen={isSettingsOpen}
           onToggle={() => setIsSettingsOpen((prev) => !prev)}
