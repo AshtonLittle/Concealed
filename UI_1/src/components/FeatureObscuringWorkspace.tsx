@@ -164,7 +164,6 @@ export const FeatureObscuringWorkspace: React.FC = () => {
         
         {/* Workspace Title & Description */}
         <div className="feature-obscuring-header">
-          <div className="feature-header-badge">PRECISION SILHOUETTE OBSCURER</div>
           <h2 className="feature-header-title">Targeted Feature Obscuring</h2>
           <p className="feature-header-subtitle">
             Detect specific visual features conforming to object silhouettes using neural vision models, and apply localized AI privacy protection.
