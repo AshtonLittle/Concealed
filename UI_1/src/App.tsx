@@ -13,7 +13,7 @@ import './App.css';
 export function App() {
   const [currentView, setCurrentView] = useState<AppView>('image');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(true);
   const [selectedImageModel, setSelectedImageModel] = useState<'onnx' | 'pt'>('onnx');
   const [concealStats, setConcealStats] = useState<ConcealStats | null>(null);
 
@@ -26,6 +26,7 @@ export function App() {
       setIsSidebarOpen(false);
     } else {
       setIsSidebarOpen(true);
+      setIsSettingsOpen(true);
     }
   }, [currentView]);
 

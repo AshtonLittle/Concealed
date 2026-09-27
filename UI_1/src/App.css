@@ -42,22 +42,27 @@
   min-height: 68px;
   background-color: #171719;
   border-bottom: 1px solid #101012;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(auto, 1fr) auto minmax(auto, 1fr);
   align-items: center;
-  justify-content: space-between;
-  padding: 0 clamp(20px, 2.5vw, 36px);
+  padding: 0 clamp(16px, 2vw, 32px);
+  gap: 16px;
   user-select: none;
   position: relative;
   z-index: 10;
   flex-shrink: 0;
+  box-sizing: border-box;
 }
 
 /* Left: CONCEALED Classic Wordmark & Navigation Tabs */
 .topbar-left {
   display: flex;
   align-items: center;
-  gap: 24px;
+  gap: 14px;
   height: 100%;
+  justify-self: start;
+  min-width: 0;
+  flex-shrink: 0;
   z-index: 2;
 }
 
@@ -68,29 +73,34 @@
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
   transition: opacity 0.15s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .concealed-header-logo {
-  height: 44px;
+  height: 38px;
   width: auto;
   object-fit: contain;
   filter: brightness(0) invert(1);
   display: block;
+  flex-shrink: 0;
 }
 
 .concealed-classic-title {
   font-family: 'Cinzel', 'Playfair Display', 'Didot', 'Baskerville', 'Times New Roman', Georgia, serif;
-  font-size: 26px;
+  font-size: 21px;
   font-weight: 700;
-  letter-spacing: 0.22em;
+  letter-spacing: 0.18em;
   color: #f7f7f9;
   text-transform: uppercase;
   display: inline-flex;
   align-items: center;
   line-height: 1;
   -webkit-font-smoothing: antialiased;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: opacity 0.15s ease;
 }
 
@@ -98,44 +108,48 @@
   opacity: 0.88;
 }
 
-/* Center: Workspace Navigation Tabs (IMAGE & VIDEO) - Centered in Header Row */
+/* Center: Workspace Navigation Tabs - Sits in Dead-Center Grid Column with Zero Overlap */
 .topbar-center {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
   display: flex;
   align-items: center;
   justify-content: center;
+  justify-self: center;
+  min-width: 0;
   z-index: 5;
 }
 
 .topbar-nav-groups {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .nav-tab-group-container {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .nav-tab-group-label {
-  font-size: 9.5px;
+  font-size: 9px;
   font-weight: 700;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: #71717a;
   user-select: none;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .nav-groups-separator {
   width: 1px;
-  height: 22px;
-  background: rgba(255, 255, 255, 0.14);
+  height: 18px;
+  background: rgba(255, 255, 255, 0.12);
+  flex-shrink: 0;
 }
 
 /* Workspace Navigation Segmented Control */
@@ -144,34 +158,38 @@
   align-items: center;
   background-color: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 9px;
+  border-radius: 8px;
   padding: 3px;
   gap: 2px;
+  flex-shrink: 0;
 }
 
-/* Topbar Right Area */
+/* Topbar Right Area - Balances the 3-column grid */
 .topbar-right {
   display: flex;
   align-items: center;
+  justify-self: end;
   min-width: 40px;
   z-index: 2;
 }
 
 .nav-segmented-tab {
-  height: 36px;
-  padding: 0 20px;
+  height: 34px;
+  padding: 0 clamp(10px, 1.1vw, 16px);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   background: transparent;
   color: #8e8e96;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   cursor: pointer;
   user-select: none;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: all 0.15s ease;
 }
 
@@ -185,6 +203,29 @@
   color: #ffffff;
   font-weight: 700;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+/* Responsive safeguards to guarantee zero overlap across viewport sizes */
+@media (max-width: 1260px) {
+  .nav-tab-group-label {
+    display: none;
+  }
+  .topbar-nav-groups {
+    gap: 8px;
+  }
+  .nav-segmented-tab {
+    padding: 0 11px;
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 920px) {
+  .concealed-classic-title {
+    display: none;
+  }
+  .topbar-center {
+    overflow-x: auto;
+  }
 }
 
 :root {
@@ -266,13 +307,13 @@
   z-index: 20;
   display: inline-flex;
   align-items: center;
-  background-color: var(--color-workspace-bg);
-  color: #ffffff;
-  border: 1px solid rgba(255, 255, 255, 0.25);
+  background-color: #1c1c20;
+  color: #ededf2;
+  border: 1px solid rgba(255, 255, 255, 0.16);
   border-right: none;
   padding: 10px 14px 10px 18px;
   border-radius: 8px 0 0 8px;
-  box-shadow: -2px 6px 18px rgba(0, 0, 0, 0.3);
+  box-shadow: -2px 6px 18px rgba(0, 0, 0, 0.45);
   cursor: pointer;
   font-size: 12px;
   font-weight: 700;
@@ -331,12 +372,12 @@
   pointer-events: none;
 }
 
-/* Right Column Settings Sidebar (Mirrors Left Column) - Gray as that of the image tab */
+/* Right Column Settings Sidebar (Mirrors Left Column) - Identical color to Statistics (#1b1b1d) */
 .settings-sidebar {
   border-right: none;
-  border-left: 1px solid rgba(255, 255, 255, 0.15);
+  border-left: 1px solid #161618;
   margin-left: auto;
-  background-color: var(--color-workspace-bg);
+  background-color: #1b1b1d;
 }
 
 .settings-sidebar.collapsed {
@@ -345,38 +386,6 @@
   pointer-events: none;
 }
 
-.settings-sidebar .statistic-card {
-  background: rgba(0, 0, 0, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 8px;
-}
-
-.settings-sidebar .statistic-card:hover {
-  background: rgba(0, 0, 0, 0.32);
-  border-color: rgba(255, 255, 255, 0.28);
-}
-
-.settings-sidebar .statistic-card-label {
-  color: #f1f1f5;
-}
-
-.settings-sidebar .sidebar-statistics-heading {
-  color: #ffffff;
-}
-
-.settings-sidebar .branding-divider {
-  background-color: rgba(255, 255, 255, 0.15);
-}
-
-.settings-sidebar .setting-pill-options {
-  background: rgba(0, 0, 0, 0.32);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-}
-
-.settings-sidebar .setting-input-wrapper {
-  background: rgba(0, 0, 0, 0.32);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-}
 
 /* Sidebar Top Bar with Title and Collapse Chevron */
 .sidebar-top-bar {
