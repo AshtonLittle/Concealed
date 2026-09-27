@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { ConcealStats } from './Sidebar';
+import type { ProtectionMode, VideoOutputFormat } from './SettingsSidebar';
 
 export interface FrameItem {
   frame_index: number;
@@ -39,20 +40,43 @@ export interface VideoAnalytics {
 export type VideoTab = 'concealed' | 'original' | 'side-by-side';
 
 export interface VideoWorkspaceProps {
+  budget?: number;
+  mode?: ProtectionMode;
+  videoFormat?: VideoOutputFormat;
+  onBudgetChange?: (budget: number) => void;
+  onModeChange?: (mode: ProtectionMode) => void;
   onProcessingStart?: () => void;
   onStatsUpdate?: (stats: ConcealStats | null) => void;
 }
 
-export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStart, onStatsUpdate }) => {
+export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
+  budget = 8,
+  mode: propMode = 'HYBRID',
+  videoFormat = 'MP4',
+  onBudgetChange,
+  onModeChange,
+  onProcessingStart,
+  onStatsUpdate,
+}) => {
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
   // Configuration States
   const [maxFrames, setMaxFrames] = useState<number>(24);
-  const [epsilon, setEpsilon] = useState<number>(8.0);
-  const [mode, setMode] = useState<string>('hybrid');
+  const [epsilon, setEpsilon] = useState<number>(budget);
+  const [mode, setMode] = useState<string>(propMode === 'RESIDUAL' ? 'canonical_residual' : propMode.toLowerCase());
   const [autoStartOnDrop, setAutoStartOnDrop] = useState<boolean>(true);
+
+  // Keep in sync with parent settings
+  useEffect(() => {
+    setEpsilon(budget);
+  }, [budget]);
+
+  useEffect(() => {
+    const mapped = propMode === 'RESIDUAL' ? 'canonical_residual' : propMode.toLowerCase();
+    setMode(mapped);
+  }, [propMode]);
 
   // Processing & Streaming States
   const [isProcessing, setIsProcessing] = useState(false);
@@ -251,6 +275,12 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
                 }
                 if (res.analytics) {
                   setAnalytics(res.analytics);
+                  onStatsUpdate?.({
+                    latencyMs: res.analytics.avg_frame_latency_ms || res.analytics.processing_time_ms || null,
+                    qualityLossPct: res.analytics.avg_ssim ? Math.max(0, (1 - res.analytics.avg_ssim) * 100) : null,
+                    psnrDb: res.analytics.avg_psnr_db || null,
+                    ssim: res.analytics.avg_ssim || null,
+                  });
                 }
                 if (res.engine) {
                   setEngineBackend(res.engine);
@@ -295,6 +325,12 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
         }
         if (resData.analytics) {
           setAnalytics(resData.analytics);
+          onStatsUpdate?.({
+            latencyMs: resData.analytics.avg_frame_latency_ms || resData.analytics.processing_time_ms || null,
+            qualityLossPct: resData.analytics.avg_ssim ? Math.max(0, (1 - resData.analytics.avg_ssim) * 100) : null,
+            psnrDb: resData.analytics.avg_psnr_db || null,
+            ssim: resData.analytics.avg_ssim || null,
+          });
         }
         if (resData.engine) {
           setEngineBackend(resData.engine);
@@ -376,7 +412,8 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
     if (!concealedVideoUrl) return;
     const a = document.createElement('a');
     a.href = concealedVideoUrl;
-    a.download = `concealed_${selectedVideo?.name ? selectedVideo.name.replace(/\.[^/.]+$/, '') : 'video'}.mp4`;
+    const ext = (videoFormat || 'MP4').toLowerCase();
+    a.download = `concealed_${selectedVideo?.name ? selectedVideo.name.replace(/\.[^/.]+$/, '') : 'video'}.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -497,7 +534,10 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
                       key={eps}
                       type="button"
                       className={`opt-chip-btn ${epsilon === eps ? 'active' : ''}`}
-                      onClick={() => setEpsilon(eps)}
+                      onClick={() => {
+                        setEpsilon(eps);
+                        onBudgetChange?.(eps);
+                      }}
                     >
                       {eps}
                     </button>
@@ -509,15 +549,18 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStar
                 <span className="option-label">SYNTHESIS</span>
                 <div className="option-btn-segmented">
                   {[
-                    { id: 'hybrid', label: 'Hybrid' },
-                    { id: 'canonical_residual', label: 'Canonical' },
-                    { id: 'native', label: 'Native' },
+                    { id: 'hybrid', label: 'Hybrid', modeVal: 'HYBRID' as const },
+                    { id: 'canonical_residual', label: 'Canonical', modeVal: 'RESIDUAL' as const },
+                    { id: 'native', label: 'Native', modeVal: 'NATIVE' as const },
                   ].map((m) => (
                     <button
                       key={m.id}
                       type="button"
                       className={`opt-chip-btn ${mode === m.id ? 'active' : ''}`}
-                      onClick={() => setMode(m.id)}
+                      onClick={() => {
+                        setMode(m.id);
+                        onModeChange?.(m.modeVal);
+                      }}
                     >
                       {m.label}
                     </button>

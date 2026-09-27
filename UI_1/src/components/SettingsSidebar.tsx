@@ -1,12 +1,22 @@
-import React, { useState } from 'react';
+import React from 'react';
 import type { AppView } from './WindowHeader';
 
-interface SettingsSidebarProps {
+export type ProtectionMode = 'HYBRID' | 'RESIDUAL' | 'NATIVE';
+export type ImageOutputFormat = 'PNG' | 'JPEG' | 'WEBP';
+export type VideoOutputFormat = 'MP4' | 'WEBM' | 'MOV';
+
+export interface SettingsSidebarProps {
   isOpen?: boolean;
   onToggle?: () => void;
   currentView?: AppView;
   selectedImageModel?: 'onnx' | 'pt';
   onSelectImageModel?: (model: 'onnx' | 'pt') => void;
+  budget?: number;
+  onBudgetChange?: (budget: number) => void;
+  mode?: ProtectionMode;
+  onModeChange?: (mode: ProtectionMode) => void;
+  format?: string;
+  onFormatChange?: (format: string) => void;
 }
 
 export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
@@ -15,23 +25,20 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
   currentView = 'image',
   selectedImageModel = 'onnx',
   onSelectImageModel,
+  budget = 8,
+  onBudgetChange,
+  mode = 'HYBRID',
+  onModeChange,
+  format = currentView === 'video' ? 'MP4' : 'PNG',
+  onFormatChange,
 }) => {
-  const [resolution, setResolution] = useState(currentView === 'video' ? '1080P' : '1080P');
-  const [format, setFormat] = useState(currentView === 'video' ? 'MP4' : 'PNG');
-  const [mode, setMode] = useState('HYBRID');
-  const [budget, setBudget] = useState('8');
+  const isVideo = currentView === 'video';
 
-  const resolutionOptions = currentView === 'video'
-    ? ['720P', '1080P', '4K']
-    : ['1080P', '1440P', '2160P'];
-
-  const formatOptions = currentView === 'video'
+  const formatOptions = isVideo
     ? ['MP4', 'WEBM', 'MOV']
     : ['PNG', 'JPEG', 'WEBP'];
 
-  const modeOptions = ['HYBRID', 'RESIDUAL', 'NATIVE'];
-
-  const isVideo = currentView === 'video';
+  const modeOptions: ProtectionMode[] = ['HYBRID', 'RESIDUAL', 'NATIVE'];
 
   return (
     <aside
@@ -133,29 +140,13 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
           )}
         </div>
 
-        {/* Card 1: Resolution */}
-        <div className="statistic-card setting-card">
-          <div className="setting-card-header">
-            <span className="statistic-card-label">RESOLUTION</span>
-          </div>
-          <div className="setting-pill-options">
-            {resolutionOptions.map((opt) => (
-              <button
-                key={opt}
-                type="button"
-                className={`setting-option-btn ${resolution === opt ? 'active' : ''}`}
-                onClick={() => setResolution(opt)}
-              >
-                {opt}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Card 2: Output Format */}
+        {/* Card 1: Output Format */}
         <div className="statistic-card setting-card">
           <div className="setting-card-header">
             <span className="statistic-card-label">OUTPUT FORMAT</span>
+            <span className="setting-model-status-badge active-tag">
+              .{format.toLowerCase()}
+            </span>
           </div>
           <div className="setting-pill-options">
             {formatOptions.map((opt) => (
@@ -163,7 +154,7 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 key={opt}
                 type="button"
                 className={`setting-option-btn ${format === opt ? 'active' : ''}`}
-                onClick={() => setFormat(opt)}
+                onClick={() => onFormatChange?.(opt)}
               >
                 {opt}
               </button>
@@ -171,10 +162,13 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
           </div>
         </div>
 
-        {/* Card 3: Protection Mode */}
+        {/* Card 2: Protection Mode */}
         <div className="statistic-card setting-card">
           <div className="setting-card-header">
             <span className="statistic-card-label">PROTECTION MODE</span>
+            <span className="setting-model-status-badge active-tag">
+              {mode}
+            </span>
           </div>
           <div className="setting-pill-options">
             {modeOptions.map((opt) => (
@@ -182,7 +176,7 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 key={opt}
                 type="button"
                 className={`setting-option-btn ${mode === opt ? 'active' : ''}`}
-                onClick={() => setMode(opt)}
+                onClick={() => onModeChange?.(opt)}
               >
                 {opt}
               </button>
@@ -190,10 +184,13 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
           </div>
         </div>
 
-        {/* Card 4: Perturbation Budget */}
+        {/* Card 3: Perturbation Budget */}
         <div className="statistic-card setting-card">
           <div className="setting-card-header">
             <span className="statistic-card-label">PERTURBATION BUDGET (ε)</span>
+            <span className="setting-model-status-badge active-tag">
+              ε = {budget}
+            </span>
           </div>
           <div className="setting-slider-container">
             <div className="setting-slider-track-wrap">
@@ -203,7 +200,7 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                 max="16"
                 step="1"
                 value={budget}
-                onChange={(e) => setBudget(e.target.value)}
+                onChange={(e) => onBudgetChange?.(Number(e.target.value))}
                 className="setting-budget-slider"
                 aria-label="Perturbation budget epsilon slider"
               />
@@ -217,7 +214,7 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
                     key={num}
                     type="button"
                     className={`slider-scale-tick ${isSelected ? 'active' : ''}`}
-                    onClick={() => setBudget(num.toString())}
+                    onClick={() => onBudgetChange?.(num)}
                     title={`Set perturbation budget to ${num}`}
                   >
                     <span className="tick-pip" />

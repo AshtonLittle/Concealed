@@ -1,13 +1,20 @@
 import React, { useState, useRef, useEffect } from 'react';
 import type { ConcealStats } from './Sidebar';
+import type { ProtectionMode, ImageOutputFormat } from './SettingsSidebar';
 
 interface ProtectionStatusProps {
   selectedModelEngine?: 'onnx' | 'pt';
+  budget?: number;
+  mode?: ProtectionMode;
+  outputFormat?: ImageOutputFormat;
   onStatsUpdate?: (stats: ConcealStats | null) => void;
 }
 
 export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
   selectedModelEngine = 'onnx',
+  budget = 8,
+  mode = 'HYBRID',
+  outputFormat = 'PNG',
   onStatsUpdate,
 }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -26,6 +33,7 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const originalFileRef = useRef<File | null>(null);
 
   useEffect(() => {
     if (selectedFile) {
@@ -65,13 +73,17 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
     e.preventDefault();
     setIsDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      setSelectedFile(e.dataTransfer.files[0]);
+      const file = e.dataTransfer.files[0];
+      originalFileRef.current = file;
+      setSelectedFile(file);
     }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      setSelectedFile(e.target.files[0]);
+      const file = e.target.files[0];
+      originalFileRef.current = file;
+      setSelectedFile(file);
     }
   };
 
@@ -81,6 +93,7 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
 
   const clearFile = (e: React.MouseEvent) => {
     e.stopPropagation();
+    originalFileRef.current = null;
     setSelectedFile(null);
     setPreviewUrl(null);
     setConcealedImageUrl(null);
@@ -93,19 +106,22 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
   };
 
   const handleConceal = async () => {
-    if (!selectedFile) return;
+    const fileToConceal = originalFileRef.current || selectedFile;
+    if (!fileToConceal) return;
 
     setIsProcessing(true);
     setErrorMsg(null);
 
+    const modeParam = mode === 'RESIDUAL' ? 'canonical_residual' : mode.toLowerCase();
+
     const formData = new FormData();
-    formData.append('file', selectedFile);
-    formData.append('epsilon', '8.0');
-    formData.append('mode', 'hybrid');
+    formData.append('file', fileToConceal);
+    formData.append('epsilon', budget.toString());
+    formData.append('mode', modeParam);
     formData.append('texture_masking', 'true');
     formData.append('chroma_damping', '0.7');
     formData.append('strip_metadata', 'true');
-    formData.append('output_format', 'ORIGINAL');
+    formData.append('output_format', outputFormat);
     formData.append('response_type', 'image');
     formData.append('model_engine', selectedModelEngine);
 
@@ -133,20 +149,20 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
 
       const psnr = parseFloat(res.headers.get('X-PSNR-dB') || '0');
       const ssim = parseFloat(res.headers.get('X-SSIM') || '0');
-      const linf = parseFloat(res.headers.get('X-Linf-255') || '8.0');
+      const linf = parseFloat(res.headers.get('X-Linf-255') || budget.toString());
       const timeMs = parseFloat(res.headers.get('X-Processing-Time-Ms') || '0');
       const rawLoss = parseFloat(res.headers.get('X-Quality-Loss-Pct') || '');
       const qualityLossPct = Number.isFinite(rawLoss)
         ? rawLoss
         : (Number.isFinite(ssim) && ssim > 0 ? Math.max(0, (1 - ssim) * 100) : 0);
 
-      const model = res.headers.get('X-Model') || 'best_generator.pt';
+      const model = res.headers.get('X-Model') || (selectedModelEngine === 'onnx' ? 'generator.onnx' : 'best_generator.pt');
 
       setTelemetry({
         model,
         psnr: Number.isFinite(psnr) ? psnr : 42.0,
         ssim: Number.isFinite(ssim) ? ssim : 0.98,
-        linf: Number.isFinite(linf) ? linf : 8.0,
+        linf: Number.isFinite(linf) ? linf : budget,
         timeMs: Number.isFinite(timeMs) ? timeMs : 0,
       });
 
@@ -169,7 +185,10 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
     if (!concealedImageUrl) return;
     const link = document.createElement('a');
     link.href = concealedImageUrl;
-    link.download = `concealed_${selectedFile?.name || 'protected.png'}`;
+    const ext = outputFormat.toLowerCase();
+    const actualExt = ext === 'jpeg' ? 'jpg' : ext;
+    const baseName = selectedFile?.name ? selectedFile.name.replace(/\.[^/.]+$/, '') : 'protected';
+    link.download = `concealed_${baseName}.${actualExt}`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -290,7 +309,7 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
 
       {/* Primary Action Button: CONCEAL IMAGE (Permanently Visible Pushbutton) */}
       {!concealedImageUrl && (
-        <div className="workspace-action-row">
+        <div className="workspace-action-row" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
           <button
             type="button"
             className="main-action-pushbutton"
@@ -312,6 +331,17 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
               </span>
             )}
           </button>
+
+          {/* Dynamic Settings Status Line */}
+          <div className="workspace-settings-summary-strip" style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px', color: '#94a3b8', letterSpacing: '0.04em' }}>
+            <span>Engine: <strong style={{ color: '#e2e8f0' }}>{selectedModelEngine === 'onnx' ? 'ONNX Runtime' : 'PyTorch'}</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Budget: <strong style={{ color: '#e2e8f0' }}>ε = {budget}</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Mode: <strong style={{ color: '#e2e8f0' }}>{mode}</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Format: <strong style={{ color: '#e2e8f0' }}>{outputFormat}</strong></span>
+          </div>
         </div>
       )}
 
@@ -338,8 +368,8 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
             </div>
           </div>
 
-          {/* Image Display */}
-          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
+          {/* Image Display with In-Flight Re-Conceal Loading Overlay */}
+          <div style={{ position: 'relative', display: 'flex', justifyContent: 'center', marginBottom: '16px' }}>
             <img
               src={activeDisplayMode === 'concealed' ? concealedImageUrl : (previewUrl || '')}
               alt={activeDisplayMode === 'concealed' ? 'Concealed result' : 'Original input'}
@@ -349,8 +379,35 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
                 borderRadius: '10px',
                 border: '1px solid rgba(255, 255, 255, 0.15)',
                 boxShadow: '0 8px 30px rgba(0, 0, 0, 0.6)',
+                opacity: isProcessing ? 0.45 : 1,
+                transition: 'opacity 0.2s ease',
               }}
             />
+            {isProcessing && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '50%',
+                  left: '50%',
+                  transform: 'translate(-50%, -50%)',
+                  background: 'rgba(15, 15, 18, 0.90)',
+                  padding: '12px 22px',
+                  borderRadius: '10px',
+                  border: '1px solid rgba(168, 85, 247, 0.45)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                  color: '#f1f1f5',
+                  fontSize: '12.5px',
+                  fontWeight: 600,
+                  boxShadow: '0 8px 28px rgba(0, 0, 0, 0.7)',
+                  pointerEvents: 'none',
+                }}
+              >
+                <span className="spinner-dots" />
+                <span>Re-concealing original image with active settings...</span>
+              </div>
+            )}
           </div>
 
           {/* Telemetry Row */}
@@ -361,6 +418,18 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
                 <span className="badge-v highlight">
                   {selectedModelEngine === 'onnx' ? 'generator.onnx' : (telemetry.model || 'best_generator.pt')}
                 </span>
+              </div>
+              <div className="telemetry-badge">
+                <span className="badge-k">MODE</span>
+                <span className="badge-v">{mode}</span>
+              </div>
+              <div className="telemetry-badge">
+                <span className="badge-k">BUDGET</span>
+                <span className="badge-v">ε = {budget}</span>
+              </div>
+              <div className="telemetry-badge">
+                <span className="badge-k">FORMAT</span>
+                <span className="badge-v">{outputFormat}</span>
               </div>
               <div className="telemetry-badge">
                 <span className="badge-k">PSNR</span>
@@ -385,12 +454,39 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
             </div>
           )}
 
+          {/* Active Target Settings & Source Strip */}
+          <div
+            className="workspace-settings-summary-strip"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexWrap: 'wrap',
+              gap: '8px',
+              fontSize: '11px',
+              color: '#94a3b8',
+              letterSpacing: '0.04em',
+              marginBottom: '14px',
+            }}
+          >
+            <span>Target: <strong style={{ color: '#e2e8f0' }}>{selectedFile?.name || 'Input Image'} (Original)</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Engine: <strong style={{ color: '#e2e8f0' }}>{selectedModelEngine === 'onnx' ? 'ONNX Runtime' : 'PyTorch'}</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Budget: <strong style={{ color: '#e2e8f0' }}>ε = {budget}</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Mode: <strong style={{ color: '#e2e8f0' }}>{mode}</strong></span>
+            <span style={{ opacity: 0.3 }}>•</span>
+            <span>Format: <strong style={{ color: '#e2e8f0' }}>{outputFormat}</strong></span>
+          </div>
+
           {/* Download & Re-process buttons */}
-          <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
+          <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', alignItems: 'center' }}>
             <button
               type="button"
               className="feature-download-btn"
               onClick={handleDownload}
+              title="Download currently protected image"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -401,12 +497,25 @@ export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
             </button>
             <button
               type="button"
-              className="mode-toggle-btn"
-              style={{ padding: '8px 14px', border: '1px solid rgba(255, 255, 255, 0.2)' }}
+              className="feature-reconceal-btn"
               onClick={handleConceal}
               disabled={isProcessing}
+              title={`Re-run protection pipeline on the original uploaded image (${selectedFile?.name || 'original'}) with current settings`}
             >
-              Re-Conceal
+              {isProcessing ? (
+                <>
+                  <span className="spinner-dots" />
+                  <span>Re-Concealing Original...</span>
+                </>
+              ) : (
+                <>
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2">
+                    <polyline points="23 4 23 10 17 10" />
+                    <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                  </svg>
+                  <span>Re-Conceal Original Image</span>
+                </>
+              )}
             </button>
           </div>
         </div>
