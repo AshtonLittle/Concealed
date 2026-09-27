@@ -238,6 +238,35 @@ def _apply_chroma_damping(delta: np.ndarray, chroma_damping: float = 0.70) -> np
     return damped
 
 
+def _remux_to_web_mp4(raw_mp4_path: str, web_mp4_path: str) -> bool:
+    """Remux an OpenCV mp4v video to standard web-compatible H.264 (yuv420p) using imageio-ffmpeg."""
+    try:
+        import imageio_ffmpeg
+        import subprocess
+
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            raw_mp4_path,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-movflags",
+            "+faststart",
+            web_mp4_path,
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+        return res.returncode == 0 and os.path.exists(web_mp4_path) and os.path.getsize(web_mp4_path) > 0
+    except Exception as e:
+        print(f"[service] Note: web MP4 conversion skipped ({e})")
+        return False
+
+
 class ObfuscationService:
     """Coordinates image decoding, adversarial synthesis, conforming masking, and encoding."""
 
@@ -251,13 +280,18 @@ class ObfuscationService:
         self.backend_name = "Algorithmic-DCT-Engine"
         self.model_path = None
 
-        # Auto-discover latest_generator.pt if not explicitly provided
+        # Auto-discover ONNX model or PyTorch checkpoint if not explicitly provided
         if checkpoint_path is None:
             candidates = [
+                os.environ.get("CONCEALED_ONNX_MODEL"),
+                "generator.onnx",
+                os.path.join(os.getcwd(), "generator.onnx"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "generator.onnx"),
                 os.environ.get("CONCEALED_CHECKPOINT"),
+                "best_generator.pt",
+                os.path.join(os.getcwd(), "best_generator.pt"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "best_generator.pt"),
                 "latest_generator.pt",
-                os.path.join(os.getcwd(), "latest_generator.pt"),
-                os.path.join(os.path.dirname(__file__), "..", "..", "latest_generator.pt"),
                 "runs/exp1/best_generator.pt",
             ]
             for cand in candidates:
@@ -265,16 +299,19 @@ class ObfuscationService:
                     checkpoint_path = str(os.path.abspath(cand))
                     break
 
-        # Attempt to load PyTorch RealtimeObfuscator if available
-        if _TORCH_AVAILABLE and checkpoint_path and os.path.exists(checkpoint_path):
+        # Attempt to load RealtimeObfuscator (ONNX Runtime or PyTorch) if available
+        if checkpoint_path and os.path.exists(checkpoint_path):
             try:
                 from concealed.pipeline.realtime import RealtimeObfuscator
                 self.torch_engine = RealtimeObfuscator(checkpoint_path, device=self.device_str)
                 self.model_path = checkpoint_path
-                self.backend_name = f"PyTorch-NeuralGenerator ({os.path.basename(checkpoint_path)})"
-                print(f"[ObfuscationService] Loaded neural generator from '{checkpoint_path}' on {self.device_str}")
+                if checkpoint_path.lower().endswith(".onnx"):
+                    self.backend_name = f"ONNXRuntime ({os.path.basename(checkpoint_path)})"
+                else:
+                    self.backend_name = f"PyTorch-NeuralGenerator ({os.path.basename(checkpoint_path)})"
+                print(f"[ObfuscationService] Loaded model from '{checkpoint_path}' on {self.device_str} ({self.backend_name})")
             except Exception as e:
-                print(f"[ObfuscationService] Note: Could not load checkpoint ({e}), running algorithmic engine.")
+                print(f"[ObfuscationService] Note: Could not load model checkpoint ({e}), running algorithmic engine.")
 
     def get_status(self) -> Dict[str, Any]:
         """Return engine capabilities and device status."""
@@ -544,6 +581,7 @@ class ObfuscationService:
             tmp_in_path = tmp_in.name
 
         tmp_out_path = tmp_in_path + "_out.mp4"
+        web_mp4_path = tmp_in_path + "_web.mp4"
 
         try:
             cap = cv2.VideoCapture(tmp_in_path)
@@ -564,26 +602,21 @@ class ObfuscationService:
                 if not ret:
                     break
 
-                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-                # Process frame
-                if self.torch_engine is not None and getattr(self.torch_engine, "generator", None) is not None:
+                # Process frame using RealtimeObfuscator (ONNX Runtime or PyTorch)
+                if self.torch_engine is not None:
                     try:
-                        gen = self.torch_engine.generator
-                        if hasattr(gen, "set_epsilon_255"):
-                            gen.set_epsilon_255(float(params.epsilon))
-                        tensor_in = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(self.torch_engine.device)
-                        with torch.no_grad():
-                            obf_t = gen(tensor_in)
-                            obf_rgb = (obf_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+                        obf_bgr = self.torch_engine.obfuscate_bgr_frame(frame_bgr)
                     except Exception:
+                        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                         delta = self._synthesize_delta(rgb, params)
                         obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                        obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
                 else:
+                    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     delta = self._synthesize_delta(rgb, params)
                     obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                    obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
 
-                obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
                 writer.write(obf_bgr)
                 frame_count += 1
                 if max_frames and frame_count >= max_frames:
@@ -592,7 +625,11 @@ class ObfuscationService:
             cap.release()
             writer.release()
 
-            with open(tmp_out_path, "rb") as f_out:
+            final_path = tmp_out_path
+            if _remux_to_web_mp4(tmp_out_path, web_mp4_path):
+                final_path = web_mp4_path
+
+            with open(final_path, "rb") as f_out:
                 out_bytes = f_out.read()
 
             elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -601,14 +638,460 @@ class ObfuscationService:
                 "fps": round(float(fps), 2),
                 "resolution": [w, h],
                 "processing_time_ms": elapsed_ms,
+                "engine": self.backend_name,
             }
             return out_bytes, "video/mp4", meta
         finally:
-            for p in (tmp_in_path, tmp_out_path):
+            for p in (tmp_in_path, tmp_out_path, web_mp4_path):
                 if os.path.exists(p):
                     try:
                         os.remove(p)
                     except Exception:
                         pass
+
+    def process_video_frames(
+        self,
+        video_bytes: bytes,
+        params: ObfuscationParams,
+        max_frames: int = 24,
+        frame_step: int = 1,
+        max_dimension: int = 640,
+    ) -> Dict[str, Any]:
+        """Break uploaded video into individual frames, apply ONNX obfuscation model frame-by-frame,
+        and return detailed frame status, before/after base64 images, metrics, and reconstructed video."""
+        import tempfile
+        import cv2
+
+        t0 = time.perf_counter()
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_in:
+            tmp_in.write(video_bytes)
+            tmp_in_path = tmp_in.name
+
+        tmp_out_path = tmp_in_path + "_obf.mp4"
+        web_mp4_path = tmp_in_path + "_web.mp4"
+
+        try:
+            cap = cv2.VideoCapture(tmp_in_path)
+            if not cap.isOpened():
+                raise ValueError("Could not open uploaded video stream.")
+
+            fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+            if fps <= 0 or math.isnan(fps):
+                fps = 24.0
+
+            total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if orig_w <= 0 or orig_h <= 0:
+                raise ValueError("Could not read video dimensions.")
+
+            # Calculate scaled resolution if dimension exceeds max_dimension
+            out_w, out_h = orig_w, orig_h
+            if max(orig_w, orig_h) > max_dimension:
+                scale = max_dimension / float(max(orig_w, orig_h))
+                out_w = int(orig_w * scale) & ~1
+                out_h = int(orig_h * scale) & ~1
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(tmp_out_path, fourcc, fps, (out_w, out_h))
+
+            frames_data = []
+            raw_frame_idx = 0
+            processed_count = 0
+            frame_latencies = []
+            psnr_list = []
+            ssim_list = []
+
+            # If video has more frames than max_frames, auto-sample uniformly across the video
+            step = max(1, frame_step)
+            if total_video_frames > max_frames and step == 1:
+                step = max(1, total_video_frames // max_frames)
+
+            while True:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+
+                if raw_frame_idx % step != 0:
+                    raw_frame_idx += 1
+                    continue
+
+                if out_w != orig_w or out_h != orig_h:
+                    frame_to_proc = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                else:
+                    frame_to_proc = frame_bgr
+
+                t_frame_start = time.perf_counter()
+
+                # Process frame using RealtimeObfuscator (ONNX Runtime or PyTorch)
+                if self.torch_engine is not None:
+                    try:
+                        obf_bgr = self.torch_engine.obfuscate_bgr_frame(frame_to_proc)
+                    except Exception:
+                        rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
+                        delta = self._synthesize_delta(rgb, params)
+                        obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                        obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+                else:
+                    rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
+                    delta = self._synthesize_delta(rgb, params)
+                    obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                    obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+
+                frame_latency_ms = round((time.perf_counter() - t_frame_start) * 1000.0, 2)
+                frame_latencies.append(frame_latency_ms)
+
+                # Write to reconstructed output video
+                writer.write(obf_bgr)
+
+                # Compute frame-level quality metrics
+                clean_rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
+                obf_rgb_final = cv2.cvtColor(obf_bgr, cv2.COLOR_BGR2RGB)
+                diff = obf_rgb_final.astype(np.float32) - clean_rgb.astype(np.float32)
+                mse = float(np.mean(diff ** 2))
+                psnr_db = round(10.0 * math.log10((255.0 ** 2) / max(mse, 1e-10)), 2)
+                linf = round(float(np.max(np.abs(diff))), 2)
+
+                # Approximate SSIM
+                c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+                gray1 = 0.299 * clean_rgb[..., 0] + 0.587 * clean_rgb[..., 1] + 0.114 * clean_rgb[..., 2]
+                gray2 = 0.299 * obf_rgb_final[..., 0] + 0.587 * obf_rgb_final[..., 1] + 0.114 * obf_rgb_final[..., 2]
+                mu1, mu2 = np.mean(gray1), np.mean(gray2)
+                s1_sq, s2_sq = np.var(gray1), np.var(gray2)
+                s12 = np.mean((gray1 - mu1) * (gray2 - mu2))
+                ssim_val = round(float(np.clip(((2 * mu1 * mu2 + c1) * (2 * s12 + c2)) / ((mu1**2 + mu2**2 + c1) * (s1_sq + s2_sq + c2) + 1e-12), 0.0, 1.0)), 4)
+
+                psnr_list.append(psnr_db)
+                ssim_list.append(ssim_val)
+
+                # Create thumbnails for frontend inspection
+                thumb_w, thumb_h = out_w, out_h
+                if thumb_w > 480:
+                    t_scale = 480.0 / thumb_w
+                    thumb_w = 480
+                    thumb_h = int(out_h * t_scale) & ~1
+                    orig_thumb = cv2.resize(frame_to_proc, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    obf_thumb = cv2.resize(obf_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                else:
+                    orig_thumb = frame_to_proc
+                    obf_thumb = obf_bgr
+
+                _, orig_buf = cv2.imencode(".jpg", orig_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                _, obf_buf = cv2.imencode(".jpg", obf_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+
+                orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
+                obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
+
+                # Synthesize visual perturbation delta map (amplified difference heatmap) for the visualizer
+                diff_amplified = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
+                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_amplified, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                if thumb_w != out_w or thumb_h != out_h:
+                    diff_thumb = cv2.resize(diff_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                else:
+                    diff_thumb = diff_bgr
+                _, diff_buf = cv2.imencode(".jpg", diff_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
+
+                timestamp_sec = round(raw_frame_idx / fps, 2)
+                frames_data.append({
+                    "frame_index": raw_frame_idx,
+                    "sequence_number": processed_count + 1,
+                    "timestamp_sec": timestamp_sec,
+                    "original_image": orig_b64,
+                    "obfuscated_image": obf_b64,
+                    "difference_image": diff_b64,
+                    "psnr_db": psnr_db,
+                    "ssim": ssim_val,
+                    "linf_255": linf,
+                    "latency_ms": frame_latency_ms,
+                    "status": "obfuscated",
+                })
+
+                processed_count += 1
+                raw_frame_idx += 1
+                if max_frames and processed_count >= max_frames:
+                    break
+
+            cap.release()
+            writer.release()
+
+            final_video_path = tmp_out_path
+            if _remux_to_web_mp4(tmp_out_path, web_mp4_path):
+                final_video_path = web_mp4_path
+
+            out_video_b64 = ""
+            if os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 0:
+                with open(final_video_path, "rb") as f_v:
+                    out_video_b64 = "data:video/mp4;base64," + base64.b64encode(f_v.read()).decode("ascii")
+
+            total_elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            avg_latency = round(float(np.mean(frame_latencies)) if frame_latencies else 0.0, 2)
+            avg_fps = round((processed_count / max(1e-6, total_elapsed_ms / 1000.0)), 2)
+            avg_psnr = round(float(np.mean(psnr_list)) if psnr_list else 0.0, 2)
+            avg_ssim = round(float(np.mean(ssim_list)) if ssim_list else 0.0, 4)
+
+            backend_id = "onnx" if (self.torch_engine and self.torch_engine.backend == "onnx") else "torch"
+
+            return {
+                "success": True,
+                "engine": self.backend_name,
+                "backend": backend_id,
+                "model_name": os.path.basename(self.model_path) if self.model_path else "generator.onnx",
+                "video_metadata": {
+                    "total_video_frames": total_video_frames,
+                    "processed_frames_count": processed_count,
+                    "fps": round(float(fps), 2),
+                    "duration_sec": round(float(total_video_frames / max(1.0, fps)), 2),
+                    "width": orig_w,
+                    "height": orig_h,
+                    "processed_width": out_w,
+                    "processed_height": out_h,
+                },
+                "analytics": {
+                    "processing_time_ms": total_elapsed_ms,
+                    "avg_frame_latency_ms": avg_latency,
+                    "avg_fps": avg_fps,
+                    "avg_psnr_db": avg_psnr,
+                    "avg_ssim": avg_ssim,
+                },
+                "frames": frames_data,
+                "video_base64": out_video_b64,
+            }
+        finally:
+            for p in (tmp_in_path, tmp_out_path, web_mp4_path):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
+    def stream_video_frames(
+        self,
+        video_bytes: bytes,
+        params: ObfuscationParams,
+        max_frames: int = 24,
+        frame_step: int = 1,
+        max_dimension: int = 640,
+    ):
+        """Generator yielding SSE events as each frame is extracted and obfuscated via ONNX model."""
+        import tempfile
+        import cv2
+        import json
+
+        t0 = time.perf_counter()
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_in:
+            tmp_in.write(video_bytes)
+            tmp_in_path = tmp_in.name
+
+        tmp_out_path = tmp_in_path + "_obf.mp4"
+        web_mp4_path = tmp_in_path + "_web.mp4"
+
+        try:
+            cap = cv2.VideoCapture(tmp_in_path)
+            if not cap.isOpened():
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Could not open video stream.'})}\n\n"
+                return
+
+            fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+            if fps <= 0 or math.isnan(fps):
+                fps = 24.0
+
+            total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if orig_w <= 0 or orig_h <= 0:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Could not read video dimensions.'})}\n\n"
+                return
+
+            out_w, out_h = orig_w, orig_h
+            if max(orig_w, orig_h) > max_dimension:
+                scale = max_dimension / float(max(orig_w, orig_h))
+                out_w = int(orig_w * scale) & ~1
+                out_h = int(orig_h * scale) & ~1
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(tmp_out_path, fourcc, fps, (out_w, out_h))
+
+            # Auto-sample step if video exceeds max_frames
+            step = max(1, frame_step)
+            if total_video_frames > max_frames and step == 1:
+                step = max(1, total_video_frames // max_frames)
+
+            frames_to_process = min(max_frames, max(1, total_video_frames // step))
+            backend_id = "onnx" if (self.torch_engine and self.torch_engine.backend == "onnx") else "torch"
+
+            # Initial status event
+            yield f"data: {json.dumps({'type': 'init', 'metadata': {'total_video_frames': total_video_frames, 'frames_to_process': frames_to_process, 'fps': round(float(fps), 2), 'duration_sec': round(float(total_video_frames / max(1.0, fps)), 2), 'width': orig_w, 'height': orig_h, 'engine': self.backend_name, 'backend': backend_id}})}\n\n"
+
+            frames_data = []
+            raw_frame_idx = 0
+            processed_count = 0
+            frame_latencies = []
+            psnr_list = []
+            ssim_list = []
+
+            while True:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    break
+
+                if raw_frame_idx % step != 0:
+                    raw_frame_idx += 1
+                    continue
+
+                if out_w != orig_w or out_h != orig_h:
+                    frame_to_proc = cv2.resize(frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                else:
+                    frame_to_proc = frame_bgr
+
+                t_frame_start = time.perf_counter()
+
+                # Process frame using RealtimeObfuscator (ONNX Runtime)
+                if self.torch_engine is not None:
+                    try:
+                        obf_bgr = self.torch_engine.obfuscate_bgr_frame(frame_to_proc)
+                    except Exception:
+                        rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
+                        delta = self._synthesize_delta(rgb, params)
+                        obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                        obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+                else:
+                    rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
+                    delta = self._synthesize_delta(rgb, params)
+                    obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                    obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+
+                frame_latency_ms = round((time.perf_counter() - t_frame_start) * 1000.0, 2)
+                frame_latencies.append(frame_latency_ms)
+
+                writer.write(obf_bgr)
+
+                clean_rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
+                obf_rgb_final = cv2.cvtColor(obf_bgr, cv2.COLOR_BGR2RGB)
+                diff = obf_rgb_final.astype(np.float32) - clean_rgb.astype(np.float32)
+                mse = float(np.mean(diff ** 2))
+                psnr_db = round(10.0 * math.log10((255.0 ** 2) / max(mse, 1e-10)), 2)
+                linf = round(float(np.max(np.abs(diff))), 2)
+
+                # SSIM
+                c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+                gray1 = 0.299 * clean_rgb[..., 0] + 0.587 * clean_rgb[..., 1] + 0.114 * clean_rgb[..., 2]
+                gray2 = 0.299 * obf_rgb_final[..., 0] + 0.587 * obf_rgb_final[..., 1] + 0.114 * obf_rgb_final[..., 2]
+                mu1, mu2 = np.mean(gray1), np.mean(gray2)
+                s1_sq, s2_sq = np.var(gray1), np.var(gray2)
+                s12 = np.mean((gray1 - mu1) * (gray2 - mu2))
+                ssim_val = round(float(np.clip(((2 * mu1 * mu2 + c1) * (2 * s12 + c2)) / ((mu1**2 + mu2**2 + c1) * (s1_sq + s2_sq + c2) + 1e-12), 0.0, 1.0)), 4)
+
+                psnr_list.append(psnr_db)
+                ssim_list.append(ssim_val)
+
+                thumb_w, thumb_h = out_w, out_h
+                if thumb_w > 480:
+                    t_scale = 480.0 / thumb_w
+                    thumb_w = 480
+                    thumb_h = int(out_h * t_scale) & ~1
+                    orig_thumb = cv2.resize(frame_to_proc, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    obf_thumb = cv2.resize(obf_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                else:
+                    orig_thumb = frame_to_proc
+                    obf_thumb = obf_bgr
+
+                _, orig_buf = cv2.imencode(".jpg", orig_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                _, obf_buf = cv2.imencode(".jpg", obf_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+
+                orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
+                obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
+
+                diff_amplified = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
+                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_amplified, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                if thumb_w != out_w or thumb_h != out_h:
+                    diff_thumb = cv2.resize(diff_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                else:
+                    diff_thumb = diff_bgr
+                _, diff_buf = cv2.imencode(".jpg", diff_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
+
+                timestamp_sec = round(raw_frame_idx / fps, 2)
+                frame_item = {
+                    "frame_index": raw_frame_idx,
+                    "sequence_number": processed_count + 1,
+                    "timestamp_sec": timestamp_sec,
+                    "original_image": orig_b64,
+                    "obfuscated_image": obf_b64,
+                    "difference_image": diff_b64,
+                    "psnr_db": psnr_db,
+                    "ssim": ssim_val,
+                    "linf_255": linf,
+                    "latency_ms": frame_latency_ms,
+                    "status": "obfuscated",
+                }
+                frames_data.append(frame_item)
+                processed_count += 1
+                raw_frame_idx += 1
+
+                progress_ratio = min(1.0, round(processed_count / max(1, frames_to_process), 2))
+                yield f"data: {json.dumps({'type': 'frame', 'frame': frame_item, 'processed': processed_count, 'total': frames_to_process, 'progress': progress_ratio})}\n\n"
+
+                if max_frames and processed_count >= max_frames:
+                    break
+
+            cap.release()
+            writer.release()
+
+            final_video_path = tmp_out_path
+            if _remux_to_web_mp4(tmp_out_path, web_mp4_path):
+                final_video_path = web_mp4_path
+
+            out_video_b64 = ""
+            if os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 0:
+                with open(final_video_path, "rb") as f_v:
+                    out_video_b64 = "data:video/mp4;base64," + base64.b64encode(f_v.read()).decode("ascii")
+
+            total_elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            avg_latency = round(float(np.mean(frame_latencies)) if frame_latencies else 0.0, 2)
+            avg_fps = round((processed_count / max(1e-6, total_elapsed_ms / 1000.0)), 2)
+            avg_psnr = round(float(np.mean(psnr_list)) if psnr_list else 0.0, 2)
+            avg_ssim = round(float(np.mean(ssim_list)) if ssim_list else 0.0, 4)
+
+            complete_payload = {
+                "type": "complete",
+                "result": {
+                    "success": True,
+                    "engine": self.backend_name,
+                    "backend": backend_id,
+                    "model_name": os.path.basename(self.model_path) if self.model_path else "generator.onnx",
+                    "video_metadata": {
+                        "total_video_frames": total_video_frames,
+                        "processed_frames_count": processed_count,
+                        "fps": round(float(fps), 2),
+                        "duration_sec": round(float(total_video_frames / max(1.0, fps)), 2),
+                        "width": orig_w,
+                        "height": orig_h,
+                        "processed_width": out_w,
+                        "processed_height": out_h,
+                    },
+                    "analytics": {
+                        "processing_time_ms": total_elapsed_ms,
+                        "avg_frame_latency_ms": avg_latency,
+                        "avg_fps": avg_fps,
+                        "avg_psnr_db": avg_psnr,
+                        "avg_ssim": avg_ssim,
+                    },
+                    "frames": frames_data,
+                    "video_base64": out_video_b64,
+                }
+            }
+            yield f"data: {json.dumps(complete_payload)}\n\n"
+
+        finally:
+            for p in (tmp_in_path, tmp_out_path, web_mp4_path):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
 
 

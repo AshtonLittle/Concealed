@@ -7,6 +7,7 @@ import json
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
+from fastapi.responses import StreamingResponse
 
 from concealed.api.schemas import (
     HealthResponse,
@@ -380,8 +381,99 @@ async def obfuscate_video(
         "X-Frames-Processed": str(meta.get("frames_processed", 0)),
         "X-FPS": str(meta.get("fps", 24)),
         "X-Processing-Time-Ms": str(meta.get("processing_time_ms", 0)),
-        "Access-Control-Expose-Headers": "Content-Disposition, X-Frames-Processed, X-FPS, X-Processing-Time-Ms",
+        "X-Engine": str(meta.get("engine", "ONNX")),
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Frames-Processed, X-FPS, X-Processing-Time-Ms, X-Engine",
     }
     return Response(content=out_bytes, media_type=mime_type, headers=headers)
+
+
+@router.post("/obfuscate/video/frames")
+async def obfuscate_video_frames(
+    file: UploadFile = File(..., description="Video file to break into frames and obfuscate"),
+    epsilon: float = Form(8.0, ge=0.5, le=64.0, description="L_infinity perturbation budget"),
+    mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID, description="Synthesis mode"),
+    max_frames: int = Form(24, ge=1, le=120, description="Maximum number of frames to extract and obfuscate"),
+    frame_step: int = Form(1, ge=1, le=30, description="Frame sampling step interval"),
+) -> Response:
+    """Break video into individual frames, execute the fast ONNX obfuscation model on each frame,
+    and return individual frame status, before/after visualizer imagery, and reconstructed video."""
+    try:
+        video_bytes = await file.read()
+        if not video_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded video file is empty.",
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error reading uploaded video file: {e}",
+        ) from e
+
+    params = ObfuscationParams(
+        epsilon=epsilon,
+        mode=mode,
+    )
+
+    try:
+        result = service.process_video_frames(
+            video_bytes=video_bytes,
+            params=params,
+            max_frames=max_frames,
+            frame_step=frame_step,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Video frame processing failed: {e}",
+        ) from e
+
+    return Response(content=json.dumps(result), media_type="application/json")
+ 
+ 
+@router.post("/obfuscate/video/stream-frames")
+async def obfuscate_video_stream_frames(
+    file: UploadFile = File(..., description="Video file to break into frames and obfuscate"),
+    epsilon: float = Form(8.0, ge=0.5, le=64.0, description="L_infinity perturbation budget"),
+    mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID, description="Synthesis mode"),
+    max_frames: int = Form(24, ge=1, le=120, description="Maximum number of frames to extract and obfuscate"),
+    frame_step: int = Form(1, ge=1, le=30, description="Frame sampling step interval"),
+) -> StreamingResponse:
+    """Break video into individual frames, execute the fast ONNX obfuscation model on each frame,
+    and stream individual frame status and before/after visualizer imagery in real-time via SSE."""
+    try:
+        video_bytes = await file.read()
+        if not video_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded video file is empty.",
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error reading uploaded video file: {e}",
+        ) from e
+
+    params = ObfuscationParams(
+        epsilon=epsilon,
+        mode=mode,
+    )
+
+    return StreamingResponse(
+        service.stream_video_frames(
+            video_bytes=video_bytes,
+            params=params,
+            max_frames=max_frames,
+            frame_step=frame_step,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 
 

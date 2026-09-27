@@ -64,7 +64,12 @@ class RealtimeObfuscator:
                 )
                 available = ort.get_available_providers()
                 active_providers = [p for p in providers if p in available] or ["CPUExecutionProvider"]
-                self.ort_session = ort.InferenceSession(str(path), providers=active_providers)
+
+                sess_options = ort.SessionOptions()
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_options.intra_op_num_threads = min(8, os.cpu_count() or 4)
+
+                self.ort_session = ort.InferenceSession(str(path), sess_options, providers=active_providers)
             else:
                 self.generator, _ = load_generator_checkpoint(
                     path,
@@ -105,6 +110,13 @@ class RealtimeObfuscator:
 
     def obfuscate_bgr_frame(self, bgr_uint8: np.ndarray) -> np.ndarray:
         """Obfuscate an OpenCV HxWx3 uint8 BGR video frame in real time."""
+        if self.backend == "onnx" and self.ort_session is not None:
+            rgb = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2RGB)
+            inp_np = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None, ...], dtype=np.float32) / 255.0
+            out_np = self.ort_session.run(["obfuscated_image"], {"input_image": inp_np})[0]
+            obf_rgb = (np.clip(out_np[0].transpose(1, 2, 0) * 255.0, 0, 255)).astype(np.uint8)
+            return cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+
         rgb = cv2.cvtColor(bgr_uint8, cv2.COLOR_BGR2RGB)
         obf_rgb = self.obfuscate_numpy(rgb)
         return cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
