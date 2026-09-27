@@ -50,6 +50,11 @@ export interface ProbeResponse {
   conceal_engine_used: string;
   paligemma_plain_english_summary?: string;
   paligemma_feature_audit?: FeatureConfidence[];
+  obfuscation_epsilon?: number | null;
+  psnr_db?: number | null;
+  ssim?: number | null;
+  linf_255?: number | null;
+  rmse_255?: number | null;
 }
 
 export interface ModelSpec {
@@ -89,5 +94,11 @@ export interface SiglipProbeResponse {
   total_options: number;
   avg_confidence_drop_pct: number;
   results: SiglipOptionScore[];
+  conceal_engine_used?: string | null;
+  obfuscation_epsilon?: number | null;
+  psnr_db?: number | null;
+  ssim?: number | null;
+  linf_255?: number | null;
+  rmse_255?: number | null;
 }
 

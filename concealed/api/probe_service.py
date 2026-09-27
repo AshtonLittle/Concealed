@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -103,12 +104,53 @@ AVAILABLE_PROBE_MODELS: List[ModelProbeSpec] = [
 ]
 
 
+# Neutral calibration anchors (never scored or displayed). SigLIP-base raw
+# sigmoid logits sit at ~-10 even for correct concepts (logit_bias=-12.9),
+# so absolute sigmoid% is ~0 for everything. Softmax over (candidates +
+# anchors) restores a discriminative readout: present concepts win share,
+# absent ones don't, and an all-irrelevant set pools on the anchors instead
+# of forcing a false winner. Prompts stay raw short phrases (SigLIP alt-text
+# style) — the CLIP "a photo of ..." template scores ~14 logits worse here.
+_SIGLIP_ANCHORS: List[str] = ["background", "blurry photo"]
+
+
 class ModelProbeService:
     """Coordinates prompt probing and visual feature audits across real Vision Transformers."""
 
     def __init__(self, device: Optional[str] = None) -> None:
         self.device_str = device or ("cuda" if _TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
         self._loaded_models: Dict[str, Any] = {}
+
+    @staticmethod
+    def _image_quality_metrics(
+        clean_rgb: np.ndarray, obf_rgb: np.ndarray
+    ) -> Tuple[float, float, float, float]:
+        """Benchmarking fidelity: PSNR, SSIM, Linf, RMSE between clean and concealed."""
+        if obf_rgb.shape != clean_rgb.shape:
+            obf_pil = Image.fromarray(obf_rgb).resize(
+                (clean_rgb.shape[1], clean_rgb.shape[0]), Image.BILINEAR
+            )
+            obf_rgb = np.array(obf_pil, dtype=np.uint8)
+        clean_f = clean_rgb.astype(np.float64)
+        obf_f = obf_rgb.astype(np.float64)
+        diff = obf_f - clean_f
+        mse = float(np.mean(diff ** 2))
+        psnr = round(10.0 * math.log10((255.0 ** 2) / max(mse, 1e-10)), 2)
+        rmse = round(float(math.sqrt(mse)), 2)
+        linf = round(float(np.max(np.abs(diff))), 2)
+        c1 = (0.01 * 255.0) ** 2
+        c2 = (0.03 * 255.0) ** 2
+        g1 = 0.299 * clean_f[..., 0] + 0.587 * clean_f[..., 1] + 0.114 * clean_f[..., 2]
+        g2 = 0.299 * obf_f[..., 0] + 0.587 * obf_f[..., 1] + 0.114 * obf_f[..., 2]
+        mu1, mu2 = float(np.mean(g1)), float(np.mean(g2))
+        s1, s2 = float(np.var(g1)), float(np.var(g2))
+        s12 = float(np.mean((g1 - mu1) * (g2 - mu2)))
+        ssim = float(np.clip(
+            ((2 * mu1 * mu2 + c1) * (2 * s12 + c2))
+            / ((mu1 ** 2 + mu2 ** 2 + c1) * (s1 + s2 + c2) + 1e-12),
+            0.0, 1.0,
+        ))
+        return psnr, round(ssim, 4), linf, rmse
 
     def get_probe_catalog(self) -> List[ModelProbeSpec]:
         """Return metadata for all supported transformer models."""
@@ -251,34 +293,47 @@ class ModelProbeService:
         proc, model = self._get_siglip()
 
         with torch.no_grad():
-            inp_c = proc(text=[prompt], images=clean_pil, return_tensors="pt", padding="max_length")
+            # Contrast the prompt against a neutral anchor in ONE shared text
+            # batch (softmax pair). Raw sigmoid% floors near 0 for every prompt
+            # on this model, and cosine ratios are noise (cosines cluster ~0).
+            texts = [prompt, _SIGLIP_ANCHORS[0]]
+            inp_c = proc(
+                text=texts, images=clean_pil, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=64,
+            )
             out_c = model(**inp_c)
+            prob_c = float(out_c.logits_per_image[0].softmax(dim=-1)[0].item())
             clean_emb = out_c.image_embeds / out_c.image_embeds.norm(dim=-1, keepdim=True)
-            text_emb = out_c.text_embeds / out_c.text_embeds.norm(dim=-1, keepdim=True)
-            cos_clean = float((clean_emb * text_emb).sum().item())
 
-            inp_o = proc(text=[prompt], images=obf_pil, return_tensors="pt", padding="max_length")
+            inp_o = proc(
+                text=texts, images=obf_pil, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=64,
+            )
             out_o = model(**inp_o)
+            prob_o = float(out_o.logits_per_image[0].softmax(dim=-1)[0].item())
             obf_emb = out_o.image_embeds / out_o.image_embeds.norm(dim=-1, keepdim=True)
-            cos_obf = float((obf_emb * text_emb).sum().item())
 
             rep_sim = float((clean_emb * obf_emb).sum().item())
 
-        sim_drop_pct = round(max(0.0, (cos_clean - cos_obf) / max(abs(cos_clean), 0.01)) * 100.0, 1)
-        evasion_pct = round(min(100.0, max(0.0, (1.0 - rep_sim) * 100.0 * 2.5)), 1)
-        dispersion_pct = round(min(99.0, max(50.0, (1.0 - rep_sim) * 110.0)), 1)
+        # Drop measured on prompt-vs-background share, not raw cosine
+        # (SigLIP cosines cluster near 0, so cosine ratios are pure noise).
+        sim_drop_pct = round(max(0.0, (prob_c - prob_o) / max(prob_c, 1e-4)) * 100.0, 1)
+        evasion_pct = round(
+            min(100.0, max(0.0, sim_drop_pct * 0.6 + (1.0 - rep_sim) * 100.0 * 1.5)), 1
+        )
+        dispersion_pct = round(min(99.0, max(0.0, (1.0 - rep_sim) * 110.0)), 1)
         status = "EVADED" if (evasion_pct > 55.0 or rep_sim < 0.92) else "PARTIAL"
 
         clean_out = (
-            f"Google SigLIP cross-entropy logit aligned with prompt (Cosine Sim: {cos_clean:.3f}). "
+            f"Google SigLIP prompt-vs-background share aligned (p={prob_c:.3f}). "
             f"Unimpaired multi-head vision attention across native 224x224 patch grid."
         )
         obf_out = (
-            f"SigLIP alignment dropped to {cos_obf:.3f} (similarity drop: {sim_drop_pct}%). "
-            f"Internal representation similarity collapsed to {rep_sim:.3f}. Sigmoid probability suppressed."
+            f"SigLIP prompt share dropped to {prob_o:.3f} (drop: {sim_drop_pct}%). "
+            f"Internal representation similarity is {rep_sim:.3f}."
         )
 
-        return clean_out, obf_out, status, evasion_pct, round(cos_clean, 3), round(cos_obf, 3), sim_drop_pct, dispersion_pct
+        return clean_out, obf_out, status, evasion_pct, round(prob_c, 3), round(prob_o, 3), sim_drop_pct, dispersion_pct
 
     def _probe_dinov2(
         self, clean_pil: Image.Image, obf_pil: Image.Image, prompt: str
@@ -372,34 +427,34 @@ class ModelProbeService:
         c_lower = blip_caption.lower()
         combined = f"{p_lower} {c_lower}"
 
-        # Face & identity cues
+        # Face & identity cues (short concrete noun phrases SigLIP can ground)
         if any(k in combined for k in ["person", "people", "face", "man", "woman", "girl", "boy", "who", "smile", "selfie", "human"]):
-            features.append("Face & Identity")
-            features.append("Facial Features & Shape")
-            features.append("Person in Photo")
-            features.append("Facial Expression")
+            features.append("a face")
+            features.append("facial features")
+            features.append("a person")
+            features.append("facial expression")
 
         # Text & document cues
         if any(k in combined for k in ["text", "read", "word", "letter", "license", "plate", "document", "id", "card", "sign"]):
-            features.append("Readable Text & Numbers")
-            features.append("Lettering & Signs")
-            features.append("Document Text")
+            features.append("readable text")
+            features.append("lettering")
+            features.append("a document")
 
         # Vehicle cues
         if any(k in combined for k in ["car", "vehicle", "truck", "automobile", "bus", "bike", "motorcycle"]):
-            features.append("Vehicle Make & Model")
-            features.append("License Plate")
+            features.append("a vehicle")
+            features.append("a license plate")
 
         # Animal & pet cues
         if any(k in combined for k in ["dog", "cat", "pet", "animal", "bird", "horse"]):
-            features.append("Animal / Pet Subject")
-            features.append("Fur & Coat Texture")
+            features.append("an animal")
+            features.append("fur texture")
 
-        # Foundational computer vision invariants
-        features.append("Main Subject")
-        features.append("Outlines & Edges")
-        features.append("Background Separation")
-        features.append("Fine Details")
+        # Fallback: one concrete scene anchor only (avoid crowding the top-5
+        # with abstract concepts like "Outlines & Edges" that SigLIP scores
+        # near-random).
+        if not features:
+            features.append("main subject")
 
         # Deduplicate while preserving order and limit to top 4-5 features
         seen = set()
@@ -427,33 +482,35 @@ class ModelProbeService:
         feature_audits: List[FeatureConfidence] = []
 
         with torch.no_grad():
-            texts: List[str] = []
-            for f in candidate_features:
-                texts.append(f"clearly visible {f.lower()}")
-                texts.append(f"unrecognizable, absent, or blurred {f.lower()}")
+            # Raw short phrases (SigLIP alt-text style, no "a photo of" wrapper
+            # — that CLIP template scores ~14 logits worse on this model) plus
+            # neutral anchors; softmax over the full set, report candidates.
+            # Identical text batch for clean and concealed keeps it comparable.
+            cand_texts: List[str] = [f.lower().strip() for f in candidate_features]
+            texts: List[str] = cand_texts + _SIGLIP_ANCHORS
 
-            inp_c = proc(text=texts, images=clean_pil, return_tensors="pt", padding="max_length")
-            inp_o = proc(text=texts, images=obf_pil, return_tensors="pt", padding="max_length")
+            inp_c = proc(
+                text=texts, images=clean_pil, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=64,
+            )
+            inp_o = proc(
+                text=texts, images=obf_pil, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=64,
+            )
 
             out_c = model(**inp_c)
             out_o = model(**inp_o)
 
-            lc = out_c.logits_per_image[0]
-            lo = out_o.logits_per_image[0]
+            probs_c = out_c.logits_per_image[0].softmax(dim=-1) * 100.0
+            probs_o = out_o.logits_per_image[0].softmax(dim=-1) * 100.0
 
             for i, feat in enumerate(candidate_features):
-                pair_c = lc[2 * i : 2 * i + 2]
-                pair_o = lo[2 * i : 2 * i + 2]
+                prob_c = float(probs_c[i].item())
+                prob_o = float(probs_o[i].item())
 
-                prob_c = float(F.softmax(pair_c, dim=-1)[0].item() * 100.0)
-                prob_o = float(F.softmax(pair_o, dim=-1)[0].item() * 100.0)
-
-                # Calibrate concealed confidence factoring the measured evasion efficacy
-                evasion_factor = max(0.2, min(0.98, overall_evasion_pct / 100.0))
-                adjusted_prob_o = max(0.5, prob_o * (1.0 - evasion_factor * 0.75))
-
-                clean_pct = round(max(5.0, prob_c), 1)
-                concealed_pct = round(min(clean_pct, adjusted_prob_o), 1)
+                # Report raw relative shares; no evasion-factor fudge.
+                clean_pct = round(min(99.9, max(0.0, prob_c)), 1)
+                concealed_pct = round(min(99.9, max(0.0, prob_o)), 1)
                 drop_pct = round(max(0.0, clean_pct - concealed_pct), 1)
 
                 if concealed_pct <= 20.0 or drop_pct >= 40.0:
@@ -525,6 +582,7 @@ class ModelProbeService:
         prompt: str = "Describe the content of the image.",
         model_ids: Optional[List[str]] = None,
         obfuscator_func: Optional[Any] = None,
+        obfuscation_epsilon: Optional[float] = None,
     ) -> ProbeResponse:
         """Run full evaluation comparing Clean vs Concealed perception across selected Vision Transformers."""
         t0 = time.perf_counter()
@@ -534,15 +592,19 @@ class ModelProbeService:
         clean_pil = Image.open(clean_stream).convert("RGB")
         clean_rgb = np.array(clean_pil, dtype=np.uint8)
 
-        # Decode or generate obfuscated image
+        # Decode or generate obfuscated image:
+        # 1. caller-provided concealed file, 2. live Concealed obfuscation,
+        # 3. synthetic-noise fallback (never silently compares image to itself).
         engine_used = "Existing/Provided"
         if obfuscated_image_bytes is not None and len(obfuscated_image_bytes) > 0:
             obf_stream = io.BytesIO(obfuscated_image_bytes)
             obf_pil = Image.open(obf_stream).convert("RGB")
+            if obf_pil.size != clean_pil.size:
+                obf_pil = obf_pil.resize(clean_pil.size, Image.BILINEAR)
             obf_rgb = np.array(obf_pil, dtype=np.uint8)
         elif obfuscator_func is not None:
             engine_used = "Concealed Realtime Generator"
-            obf_rgb = obfuscator_func(clean_rgb)
+            obf_rgb = np.asarray(obfuscator_func(clean_rgb), dtype=np.uint8)
             obf_pil = Image.fromarray(obf_rgb)
         else:
             engine_used = "High-Frequency Dispersion"
@@ -671,6 +733,8 @@ class ModelProbeService:
             )
             r.feature_confidences = feature_audits
 
+        psnr_db, ssim_val, linf_val, rmse_val = self._image_quality_metrics(clean_rgb, obf_rgb)
+
         return ProbeResponse(
             success=True,
             prompt=prompt,
@@ -683,6 +747,11 @@ class ModelProbeService:
             conceal_engine_used=engine_used,
             paligemma_plain_english_summary=plain_english_summary,
             paligemma_feature_audit=feature_audits,
+            obfuscation_epsilon=obfuscation_epsilon,
+            psnr_db=psnr_db,
+            ssim=ssim_val,
+            linf_255=linf_val,
+            rmse_255=rmse_val,
         )
 
     def probe_options_siglip(
@@ -691,6 +760,7 @@ class ModelProbeService:
         obfuscated_image_bytes: Optional[bytes] = None,
         options: Optional[List[str]] = None,
         obfuscator_func: Optional[Any] = None,
+        obfuscation_epsilon: Optional[float] = None,
     ) -> SiglipProbeResponse:
         """Run real Google SigLIP (google/siglip-base-patch16-224) confidence evaluation for user options."""
         # 1. Decode clean image
@@ -698,14 +768,20 @@ class ModelProbeService:
         clean_pil = Image.open(clean_stream).convert("RGB")
         clean_rgb = np.array(clean_pil, dtype=np.uint8)
 
-        # 2. Decode or generate obfuscated image
+        # 2. Decode or generate obfuscated image (same 3-way priority as probe_image)
+        engine_used = "Existing/Provided"
         if obfuscated_image_bytes is not None and len(obfuscated_image_bytes) > 0:
             obf_stream = io.BytesIO(obfuscated_image_bytes)
             obf_pil = Image.open(obf_stream).convert("RGB")
+            if obf_pil.size != clean_pil.size:
+                obf_pil = obf_pil.resize(clean_pil.size, Image.BILINEAR)
+            obf_rgb = np.array(obf_pil, dtype=np.uint8)
         elif obfuscator_func is not None:
-            obf_rgb = obfuscator_func(clean_rgb)
+            engine_used = "Concealed Realtime Generator"
+            obf_rgb = np.asarray(obfuscator_func(clean_rgb), dtype=np.uint8)
             obf_pil = Image.fromarray(obf_rgb)
         else:
+            engine_used = "High-Frequency Dispersion"
             h, w = clean_rgb.shape[:2]
             noise = (np.random.randn(h, w, 3) * 7.0).clip(-12.0, 12.0)
             obf_rgb = np.clip(clean_rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
@@ -726,51 +802,29 @@ class ModelProbeService:
 
         proc, model = self._get_siglip()
 
-        # 1. Pairwise presence (independent confidence 0-100% per option)
-        texts_presence = []
-        for opt in clean_options:
-            texts_presence.append(f"a photo containing {opt.lower()}")
-            texts_presence.append(f"a photo without {opt.lower()}")
-
-        # 2. Multi-class texts
-        texts_multiclass = [f"a photo of {opt.lower()}" for opt in clean_options]
+        # Raw user phrases (no "a photo of" wrapper — that CLIP template
+        # scores far worse on SigLIP) + neutral anchors; softmax over the full
+        # set, report only the user's options. Identical batch for clean/obf.
+        opt_texts = [opt.lower().strip() for opt in clean_options]
+        texts = opt_texts + _SIGLIP_ANCHORS
 
         with torch.no_grad():
-            inp_c_pair = proc(text=texts_presence, images=clean_pil, padding="max_length", return_tensors="pt")
-            out_c_pair = model(**inp_c_pair)
-            lc_pair = out_c_pair.logits_per_image[0]
+            inp_c = proc(
+                text=texts, images=clean_pil, padding="max_length",
+                truncation=True, max_length=64, return_tensors="pt",
+            )
+            probs_c = model(**inp_c).logits_per_image[0].softmax(dim=-1) * 100.0
 
-            inp_o_pair = proc(text=texts_presence, images=obf_pil, padding="max_length", return_tensors="pt")
-            out_o_pair = model(**inp_o_pair)
-            lo_pair = out_o_pair.logits_per_image[0]
-
-            if len(clean_options) > 1:
-                inp_c_mc = proc(text=texts_multiclass, images=clean_pil, padding="max_length", return_tensors="pt")
-                lc_mc = model(**inp_c_mc).logits_per_image[0]
-                probs_c_mc = F.softmax(lc_mc, dim=-1)
-
-                inp_o_mc = proc(text=texts_multiclass, images=obf_pil, padding="max_length", return_tensors="pt")
-                lo_mc = model(**inp_o_mc).logits_per_image[0]
-                probs_o_mc = F.softmax(lo_mc, dim=-1)
-            else:
-                probs_c_mc = None
-                probs_o_mc = None
+            inp_o = proc(
+                text=texts, images=obf_pil, padding="max_length",
+                truncation=True, max_length=64, return_tensors="pt",
+            )
+            probs_o = model(**inp_o).logits_per_image[0].softmax(dim=-1) * 100.0
 
         scores: List[SiglipOptionScore] = []
         for i, opt in enumerate(clean_options):
-            pair_c = lc_pair[2 * i : 2 * i + 2]
-            pair_o = lo_pair[2 * i : 2 * i + 2]
-            pc_pair = float(F.softmax(pair_c, dim=-1)[0].item() * 100.0)
-            po_pair = float(F.softmax(pair_o, dim=-1)[0].item() * 100.0)
-
-            if probs_c_mc is not None and probs_o_mc is not None:
-                mc_c = float(probs_c_mc[i].item() * 100.0)
-                mc_o = float(probs_o_mc[i].item() * 100.0)
-                clean_conf = round(0.6 * pc_pair + 0.4 * mc_c, 1)
-                obf_conf = round(0.6 * po_pair + 0.4 * mc_o, 1)
-            else:
-                clean_conf = round(pc_pair, 1)
-                obf_conf = round(po_pair, 1)
+            clean_conf = round(min(99.9, max(0.0, float(probs_c[i].item()))), 1)
+            obf_conf = round(min(99.9, max(0.0, float(probs_o[i].item()))), 1)
 
             drop = round(max(0.0, clean_conf - obf_conf), 1)
 
@@ -795,6 +849,8 @@ class ModelProbeService:
         avg_drop = round(sum(s.confidence_drop_pct for s in scores) / max(len(scores), 1), 1)
         protection_pct = round(min(100.0, max(0.0, (hidden_count / max(len(scores), 1)) * 60.0 + avg_drop * 0.4)), 1)
 
+        psnr_db, ssim_val, linf_val, rmse_val = self._image_quality_metrics(clean_rgb, obf_rgb)
+
         return SiglipProbeResponse(
             success=True,
             clean_image_url=clean_url,
@@ -804,5 +860,11 @@ class ModelProbeService:
             total_options=len(scores),
             avg_confidence_drop_pct=avg_drop,
             results=scores,
+            conceal_engine_used=engine_used,
+            obfuscation_epsilon=obfuscation_epsilon,
+            psnr_db=psnr_db,
+            ssim=ssim_val,
+            linf_255=linf_val,
+            rmse_255=rmse_val,
         )
 

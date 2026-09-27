@@ -261,6 +261,12 @@ class ProbeResponse(BaseModel):
     conceal_engine_used: str
     paligemma_plain_english_summary: Optional[str] = None
     paligemma_feature_audit: Optional[List[FeatureConfidence]] = None
+    # Benchmarking: which obfuscation produced the concealed image + fidelity cost
+    obfuscation_epsilon: Optional[float] = None
+    psnr_db: Optional[float] = None
+    ssim: Optional[float] = None
+    linf_255: Optional[float] = None
+    rmse_255: Optional[float] = None
 
 
 class SiglipOptionScore(BaseModel):
@@ -284,5 +290,12 @@ class SiglipProbeResponse(BaseModel):
     total_options: int
     avg_confidence_drop_pct: float
     results: List[SiglipOptionScore]
+    # Benchmarking: which obfuscation produced the concealed image + fidelity cost
+    conceal_engine_used: Optional[str] = None
+    obfuscation_epsilon: Optional[float] = None
+    psnr_db: Optional[float] = None
+    ssim: Optional[float] = None
+    linf_255: Optional[float] = None
+    rmse_255: Optional[float] = None
 
 
