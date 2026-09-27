@@ -129,13 +129,13 @@ class DifferentiableEOT(nn.Module):
     def __init__(
         self,
         enabled: bool = True,
-        jpeg_prob: float = 0.8,
-        jpeg_quality_min: float = 60.0,
-        jpeg_quality_max: float = 95.0,
-        random_scale_min: float = 0.75,
-        random_scale_max: float = 1.25,
-        tile_crop_prob: float = 0.5,
-        color_jitter_strength: float = 0.03,
+        jpeg_prob: float = 0.25,
+        jpeg_quality_min: float = 82.0,
+        jpeg_quality_max: float = 98.0,
+        random_scale_min: float = 0.90,
+        random_scale_max: float = 1.10,
+        tile_crop_prob: float = 0.15,
+        color_jitter_strength: float = 0.02,
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
@@ -158,34 +158,43 @@ class DifferentiableEOT(nn.Module):
         b, _, h, w = x_obf.shape
         device = x_obf.device
 
+        # 0. Straight-Through 8-bit uint8 quantization so synthesized perturbations survive PNG/WebP saving
+        x_obf = x_obf + ((x_obf * 255.0).round().clamp(0.0, 255.0) / 255.0 - x_obf).detach()
+
         # 1. Differentiable JPEG compression on obfuscated image
         if torch.rand(1, device=device).item() < self.jpeg_prob:
-            q = torch.empty(1, device=device).uniform_(self.jpeg_quality_min, self.jpeg_quality_max).item()
+            q = torch.empty(1, device=device).uniform_(max(80.0, self.jpeg_quality_min), self.jpeg_quality_max).item()
             x_obf = self.diff_jpeg(x_obf, quality=q)
 
-        # 2. Mild photometric jitter on obfuscated image
-        if self.color_jitter_strength > 0.0:
+        # 2. Paired mild photometric jitter on both clean and obfuscated images
+        if self.color_jitter_strength > 0.0 and torch.rand(1, device=device).item() < 0.35:
             brightness = (torch.rand(b, 1, 1, 1, device=device) * 2.0 - 1.0) * self.color_jitter_strength
             contrast = 1.0 + (torch.rand(b, 1, 1, 1, device=device) * 2.0 - 1.0) * self.color_jitter_strength
+            x_clean = torch.clamp((x_clean - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
             x_obf = torch.clamp((x_obf - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
 
-        # 3. Paired spatial transform: either VLM high-res tile crop OR multi-scale DI-FGSM resize
-        if h >= 256 and w >= 256 and torch.rand(1, device=device).item() < self.tile_crop_prob:
-            # Simulate a high-res VLM local tile crop (50%-75% of image dimensions)
-            crop_ratio = torch.empty(1, device=device).uniform_(0.5, 0.75).item()
+        # 3. Paired spatial transform: preserve exact full-frame ViT patch grid on 75% of steps;
+        #    apply VLM tile crop or mild DI-FGSM multi-scale resize on the remaining 25%
+        r_spatial = torch.rand(1, device=device).item()
+        if h >= 256 and w >= 256 and r_spatial < min(0.15, self.tile_crop_prob):
+            crop_ratio = torch.empty(1, device=device).uniform_(0.75, 0.95).item()
             ch = max(64, int(h * crop_ratio))
             cw = max(64, int(w * crop_ratio))
             top = int(torch.randint(0, max(1, h - ch + 1), (1,), device=device).item())
             left = int(torch.randint(0, max(1, w - cw + 1), (1,), device=device).item())
             x_clean_aug = x_clean[:, :, top : top + ch, left : left + cw]
             x_obf_aug = x_obf[:, :, top : top + ch, left : left + cw]
-        else:
-            # Multi-scale DI-FGSM random resize
-            scale = torch.empty(1, device=device).uniform_(self.random_scale_min, self.random_scale_max).item()
+        elif r_spatial < 0.25:
+            s_min = max(0.90, self.random_scale_min)
+            s_max = min(1.10, self.random_scale_max)
+            scale = torch.empty(1, device=device).uniform_(s_min, s_max).item()
             nh = max(64, int(round(h * scale)))
             nw = max(64, int(round(w * scale)))
             x_clean_aug = F.interpolate(x_clean, size=(nh, nw), mode="bilinear", align_corners=False)
             x_obf_aug = F.interpolate(x_obf, size=(nh, nw), mode="bilinear", align_corners=False)
+        else:
+            x_clean_aug = x_clean
+            x_obf_aug = x_obf
 
         return x_clean_aug, x_obf_aug
 
@@ -195,11 +204,11 @@ def build_eot(config: dict) -> DifferentiableEOT:
     eot_cfg = config.get("eot", config)
     return DifferentiableEOT(
         enabled=eot_cfg.get("enabled", True),
-        jpeg_prob=eot_cfg.get("jpeg_prob", 0.8),
-        jpeg_quality_min=eot_cfg.get("jpeg_quality_min", 60.0),
-        jpeg_quality_max=eot_cfg.get("jpeg_quality_max", 95.0),
-        random_scale_min=eot_cfg.get("random_scale_min", 0.75),
-        random_scale_max=eot_cfg.get("random_scale_max", 1.25),
-        tile_crop_prob=eot_cfg.get("tile_crop_prob", 0.5),
-        color_jitter_strength=eot_cfg.get("color_jitter_strength", 0.03),
+        jpeg_prob=eot_cfg.get("jpeg_prob", 0.25),
+        jpeg_quality_min=eot_cfg.get("jpeg_quality_min", 82.0),
+        jpeg_quality_max=eot_cfg.get("jpeg_quality_max", 98.0),
+        random_scale_min=eot_cfg.get("random_scale_min", 0.90),
+        random_scale_max=eot_cfg.get("random_scale_max", 1.10),
+        tile_crop_prob=eot_cfg.get("tile_crop_prob", 0.15),
+        color_jitter_strength=eot_cfg.get("color_jitter_strength", 0.02),
     )
