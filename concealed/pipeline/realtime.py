@@ -233,7 +233,8 @@ class RealtimeObfuscator:
         dev = self.device
         x_c = x_clean.to(dev).float()
         x_0 = x_init.to(dev).float()
-        eps = float(epsilon_255 if epsilon_255 is not None else (self.generator.epsilon_255 if self.generator else 10.0)) / 255.0
+        default_eps = min(float(self.generator.epsilon_255), 7.0) if self.generator else 7.0
+        eps = float(epsilon_255 if epsilon_255 is not None else default_eps) / 255.0
 
         if Path(".snowflake_hf_cache").exists():
             os.environ.setdefault("HF_HOME", str(Path(".snowflake_hf_cache").resolve()))
@@ -257,17 +258,23 @@ class RealtimeObfuscator:
             "timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k",
         ]
         models = [VisionTransformerSurrogate(n, tap_layers=(-3, -2, -1)).to(dev).eval() for n in names]
-        weber = WeberTextureMask(min_mask_scale=0.14).to(dev)
+        weber = WeberTextureMask(min_mask_scale=0.05).to(dev)
 
         h, w = x_c.shape[-2], x_c.shape[-1]
         with torch.no_grad():
-            tex_mask = weber(x_c)
+            # Strictly native-resolution edge/texture mask so smooth skin (cheeks/forehead) stays wrinkle-free
+            lum = 0.299 * x_c[:, 0:1] + 0.587 * x_c[:, 1:2] + 0.114 * x_c[:, 2:3]
+            grads = F.conv2d(F.pad(lum, (1, 1, 1, 1), mode="reflect"), weber.sobel_kernels)
+            mag = torch.sqrt(grads[:, 0:1] ** 2 + grads[:, 1:2] ** 2 + 1e-6)
+            native_energy = F.avg_pool2d(mag, kernel_size=7, stride=1, padding=3)
+            tex_mask = 0.08 + 0.92 * torch.tanh(native_energy * 22.0)
+
             clean_targets = [m(x_c) for m in models]
             if self.generator is not None:
                 x_224 = F.interpolate(x_c, size=(224, 224), mode="bilinear", align_corners=False)
                 x_384 = F.interpolate(x_c, size=(384, 384), mode="bilinear", align_corners=False)
-                raw_init_224 = (0.35 * torch.tanh(self.generator._forward_padded(x_224))).detach().clone()
-                raw_init_384 = (0.35 * torch.tanh(self.generator._forward_padded(x_384))).detach().clone()
+                raw_init_224 = (0.25 * torch.tanh(self.generator._forward_padded(x_224))).detach().clone()
+                raw_init_384 = (0.25 * torch.tanh(self.generator._forward_padded(x_384))).detach().clone()
             else:
                 init_delta = (x_0 - x_c).clamp(-eps * 0.99, eps * 0.99)
                 init_224 = F.interpolate(init_delta, size=(224, 224), mode="bilinear", align_corners=False)
@@ -277,19 +284,22 @@ class RealtimeObfuscator:
 
         param_224 = raw_init_224.requires_grad_(True)
         param_384 = raw_init_384.requires_grad_(True)
-        opt = torch.optim.Adam([param_224, param_384], lr=0.28)
+        opt = torch.optim.Adam([param_224, param_384], lr=0.14)
 
         def _synthesize_delta() -> torch.Tensor:
-            # High-pass filter at both 224 and 384 scales so no wide (>9px) wavy bands can form
-            hp_224 = param_224 - F.avg_pool2d(param_224, kernel_size=9, stride=1, padding=4)
-            hp_384 = param_384 - F.avg_pool2d(param_384, kernel_size=9, stride=1, padding=4)
-            up_224 = F.interpolate(hp_224, size=(h, w), mode="bilinear", align_corners=False)
-            up_384 = F.interpolate(hp_384, size=(h, w), mode="bilinear", align_corners=False)
-            raw = 0.65 * up_224 + 0.35 * up_384
-            d = eps * torch.tanh(raw)
-            # YCbCr chrominance damping (suppresses magenta/green waves by 75%)
+            # High-pass filter + soft tanh BEFORE upsampling so zero-crossings never form sharp contour wrinkles at HD
+            hp_224 = param_224 - F.avg_pool2d(param_224, kernel_size=7, stride=1, padding=3)
+            hp_384 = param_384 - F.avg_pool2d(param_384, kernel_size=7, stride=1, padding=3)
+            d_224 = torch.tanh(hp_224 * 0.85)
+            d_384 = torch.tanh(hp_384 * 0.85)
+            up_224 = F.interpolate(d_224, size=(h, w), mode="bicubic", align_corners=False)
+            up_384 = F.interpolate(d_384, size=(h, w), mode="bicubic", align_corners=False)
+            d = eps * (0.60 * up_224 + 0.40 * up_384)
+            # Smooth out any sub-pixel bicubic ringing
+            d = F.avg_pool2d(d, kernel_size=3, stride=1, padding=1)
+            # YCbCr chrominance damping (suppresses magenta/green waves by 82%)
             d_y = 0.299 * d[:, 0:1] + 0.587 * d[:, 1:2] + 0.114 * d[:, 2:3]
-            d = (d_y + 0.25 * (d - d_y)) * tex_mask
+            d = (d_y + 0.18 * (d - d_y)) * tex_mask
             return torch.clamp(d, -eps, eps)
 
         print(f"\n--- Running Hybrid High-Pass ViT Refinement ({steps} steps, eps={eps * 255:.1f}/255) ---", flush=True)
@@ -298,7 +308,16 @@ class RealtimeObfuscator:
             delta = _synthesize_delta()
             x_adv = torch.clamp(x_c + delta, 0.0, 1.0)
 
-            total_loss = torch.tensor(0.0, device=dev)
+            # Total Variation smoothness penalty on canonical grids to prevent wrinkly/wormy ridges
+            tv_224 = (
+                (param_224[:, :, 1:, :] - param_224[:, :, :-1, :]).pow(2).mean()
+                + (param_224[:, :, :, 1:] - param_224[:, :, :, :-1]).pow(2).mean()
+            )
+            tv_384 = (
+                (param_384[:, :, 1:, :] - param_384[:, :, :-1, :]).pow(2).mean()
+                + (param_384[:, :, :, 1:] - param_384[:, :, :, :-1]).pow(2).mean()
+            )
+            total_loss = 0.15 * (tv_224 + tv_384) + 12.0 * delta.pow(2).mean()
             p_cos_list = []
             s_cos_list = []
             g_cos_list = []

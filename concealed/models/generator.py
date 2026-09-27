@@ -209,16 +209,16 @@ class WeberTextureMask(nn.Module):
         # Smooth local texture energy over a 5x5 neighborhood
         energy = F.avg_pool2d(mag, kernel_size=5, stride=1, padding=2)
 
-        # Combine with canonical 224x224 Sobel gradient energy so high-resolution (720p/1080p/4K)
-        # images have the exact same structural mask amplitude as 224x224 training images
+        # Geometric mean with canonical 224x224 Sobel energy: boosts true high-res edges
+        # without bleeding a 224x224 blur halo onto adjacent smooth facial skin or flat walls
         lum_canon = F.interpolate(lum, size=(224, 224), mode="bilinear", align_corners=False)
         grads_c = F.conv2d(F.pad(lum_canon, (1, 1, 1, 1), mode="reflect"), self.sobel_kernels)
         mag_c = torch.sqrt(grads_c[:, 0:1] ** 2 + grads_c[:, 1:2] ** 2 + 1e-6)
-        energy_c = F.avg_pool2d(mag_c, kernel_size=5, stride=1, padding=2)
+        energy_c = F.avg_pool2d(mag_c, kernel_size=3, stride=1, padding=1)
         energy_c = F.interpolate(energy_c, size=(lum.shape[-2], lum.shape[-1]), mode="bilinear", align_corners=False)
-        energy = torch.maximum(energy, energy_c)
+        energy = torch.sqrt(energy * energy_c + 1e-8)
 
-        normalized = torch.tanh(energy * 12.0)
+        normalized = torch.tanh(energy * 14.0)
         mask = self.min_mask_scale + (1.0 - self.min_mask_scale) * normalized
         return mask
 
@@ -406,18 +406,17 @@ class AmortizedObfuscationGenerator(nn.Module):
         elif active_mode == "hybrid":
             # 1. Global canonical pass (survives downsampling to thumbnail ViTs)
             x_canon = F.interpolate(x, size=(s, s), mode="bilinear", align_corners=False)
-            raw_global = self._forward_backbone(x_canon)
-            raw_global = F.interpolate(raw_global, size=(h, w), mode="bilinear", align_corners=False)
+            raw_global = torch.tanh(self._forward_backbone(x_canon))
+            delta_global = F.interpolate(raw_global, size=(h, w), mode="bilinear", align_corners=False)
 
             # 2. High-res tile grid pass (defeats high-res tile-slicing VLMs like GPT-4o / Gemini / Qwen2-VL)
             local_s = max(16, (self.tile_size // 8) * 8)
             x_local = F.interpolate(x, size=(local_s, local_s), mode="bilinear", align_corners=False)
-            raw_local = self._forward_backbone(x_local)
-            raw_local = F.interpolate(raw_local, size=(h, w), mode="bilinear", align_corners=False)
+            raw_local = torch.tanh(self._forward_backbone(x_local))
+            delta_local = F.interpolate(raw_local, size=(h, w), mode="bilinear", align_corners=False)
 
             alpha = self.hybrid_global_weight
-            raw_blended = alpha * raw_global + (1.0 - alpha) * raw_local
-            delta = self.epsilon * torch.tanh(raw_blended)
+            delta = self.epsilon * (alpha * delta_global + (1.0 - alpha) * delta_local)
 
         else:
             raise ValueError(f"Unsupported synthesis mode: {active_mode}")
