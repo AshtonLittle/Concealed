@@ -1,54 +1,74 @@
-# Concealed AI - Compression & Pre-Formatting Engine
+# Concealed
 
-Dedicated repository branch for high-fidelity image compression, client-side pre-formatting, and platform counter-prevention verification.
+**Amortized Adversarial Generator Network for Real-Time Image Obfuscation Against Vision Transformers, with Client-Side Pre-Formatting & Platform Counter-Prevention Compression.**
 
-## Architecture
+`Concealed` trains a compact, single-pass neural network ($G_\theta$) that synthesizes visually imperceptible, $L_\infty$-bounded perturbations ($\delta = G_\theta(x)$, $\|\delta\|_\infty \le \epsilon$) designed to disrupt open-source and frontier Vision Transformer (ViT) representations in real-time pipelines.
 
-The engine is structured into three specialized modules:
+Additionally, this branch includes the dedicated **Client-Side Pre-Formatting, Adaptive Compression, and Counter-Prevention Engine** to ensure protected photos survive downstream social media ingestion (Instagram, WhatsApp, Facebook) without server-side re-compression or color degradation.
 
-1. **Client-Side Pre-Formatting (`concealed/preformatting/`)**
-   - **Platform Profiles**: Native standardization for Instagram (`instagram_feed`, `instagram_story`), WhatsApp, Facebook, and Universal.
-   - **Resolution & Lanczos Scaling**: Scales to platform thresholds (e.g. 1080px width) using high-precision Lanczos interpolation.
-   - **sRGB Color Space Compliance**: Harmonizes wide-gamut photos (Display P3, Adobe RGB, CMYK) to standard sRGB (IEC61966-2.1) and embeds the standard ICC profile.
-   - **EXIF Sanitization**: Strips GPS coordinates, camera/device serials, timestamps, and metadata to protect privacy and reduce file size.
-   - **Aspect Ratio Formatting**: Supports `fit_width`, `contain` (padding), and `crop` strategies.
+---
 
-2. **Adaptive Compression (`concealed/compression/`)**
-   - **Multi-Format Support**: High-performance encoding for JPEG, WebP, and PNG.
-   - **Adaptive Quality ($Q \in [1, 100]$)**: Loss-controlled compression with progressive rendering and Huffman table optimization.
-   - **Chroma Subsampling Control**:
-     - `444` (`0`): Zero chroma subsampling for pristine color and edge fidelity.
-     - `420` (`2`): Standard web bandwidth optimization.
-     - `422` (`1`): Balanced chroma subsampling.
-   - **Target-Size Budgeting (Rate Control)**: In-memory binary search optimization to hit strict file size caps (e.g. `< 1.5MB` or custom KB budget).
+## Key Capabilities
 
-3. **Counter-Prevention & Ingestion Verification (`concealed/counter_prevention/`)**
-   - **Ingestion Simulator**: Simulates server-side platform upload pipelines (MozJPEG/LibJPEG downsampling, forced 4:2:0 subsampling, re-compression).
-   - **Quality Survival Metrics**: Computes PSNR (Peak Signal-to-Noise Ratio), SSIM (Structural Similarity Index), and MAE.
-   - **Re-Compression Risk Analysis**: Categorizes degradation risk (`LOW`, `MEDIUM`, `HIGH`) and generates actionable counter-prevention recommendations.
+1. **Single-Pass Real-Time Inference**:
+   - Unlike iterative per-image PGD methods (Glaze, Nightshade, PhotoGuard) that take seconds to minutes per image, `Concealed` amortizes perturbation optimization over your image dataset during training.
+   - At inference time, the ViT surrogates are discarded—leaving a ~1.8M parameter generator that executes in **<10ms on GPU** and **<40ms on CPU** and exports cleanly to **ONNX**, **TensorRT**, and **TorchScript**.
+2. **Hybrid Global + High-Res Tile Synthesis (`hybrid` mode)**:
+   - Evaluates a full-image global context branch alongside non-overlapping $512\times 512$ high-resolution tiles, blending boundary transitions using dynamic feathering masks to prevent block edge seams.
+3. **Four-Backbone ViT Ensemble Defense**:
+   - Multi-target representation collapse across distinct visual architectures:
+     - `google/vit-base-patch16-224` (Standard classification ViT)
+     - `facebook/dino-vitb16` (Self-supervised patch representations)
+     - `openai/clip-vit-base-patch32` (Multimodal vision-language space)
+     - `facebook/dinov2-base` (Dense high-resolution geometric features)
+4. **Client-Side Pre-Formatting (`concealed/preformatting/`)**:
+   - Scales to platform standards (e.g. 1080px width) using high-precision Lanczos interpolation (`Image.Resampling.LANCZOS`).
+   - Converts wide-gamut photos (Display P3, Adobe RGB, CMYK) to standard **sRGB (IEC61966-2.1)** with embedded ICC profile to prevent platform color-mangling.
+   - Strips EXIF metadata (GPS, camera serials, timestamps) for user privacy.
+5. **Adaptive Loss-Controlled Compression (`concealed/compression/`)**:
+   - Multi-format support (JPEG, WebP, PNG).
+   - Chroma subsampling management (4:4:4 pristine color preservation vs 4:2:0 bandwidth saving).
+   - Rate-control binary search budgeting to hit strict file size caps (e.g. `< 1.5MB`).
+6. **Platform Counter-Prevention Verification (`concealed/counter_prevention/`)**:
+   - Simulates downstream platform ingestion (Instagram, WhatsApp, Facebook).
+   - Computes survival PSNR, SSIM, and MAE to verify images withstand downstream compression without degradation.
 
 ---
 
 ## Quickstart CLI
 
-Run the image processor via `image_processor.py`:
-
+### 1. Compression, Pre-Formatting & Counter-Prevention
 ```bash
 # Standard Instagram compression (1080px Lanczos, sRGB, 4:4:4 chroma, Q=90)
 python image_processor.py my_photo.jpg -o my_photo_compressed.jpg --platform instagram_feed --quality 90
 
-# Target file size budgeting (e.g. cap at 800 KB)
+# Target file size budgeting (e.g. cap under 800 KB)
 python image_processor.py my_photo.jpg -o my_photo_budget.jpg --target-size-kb 800
 
 # WhatsApp profile (max 1600px dimension)
 python image_processor.py my_photo.jpg --platform whatsapp --chroma 420
 ```
 
+### 2. Real-Time Obfuscation Inference
+```bash
+# Obfuscate a single image or folder with Amortized Generator
+python -m concealed.pipeline.realtime --input my_photo.jpg --output protected_photo.png --device cuda
+```
+
+### 3. Model Training & Evaluation
+```bash
+# Run local generator training
+python -m concealed.train --data-dir ./data --epochs 20 --batch-size 4
+
+# Run surrogate representation collapse evaluation
+python -m concealed.evaluate --checkpoint ./checkpoints/generator_latest.pt --data-dir ./test_images
+```
+
 ---
 
 ## Running Tests
 
-Execute the automated test suite:
+Run the test suite:
 
 ```bash
 python -m unittest discover -s tests -v

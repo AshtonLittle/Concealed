@@ -51,6 +51,16 @@ desktop.ini
 *.swp
 *.swo
 
+# Project model weights & runs
+runs/
+checkpoints/
+trained_model/
+.snowflake_hf_cache/
+.env
+*.onnx
+*.pt
+*.tar
+
 # User images & outputs (keep repo clean)
 *.jpg
 *.jpeg

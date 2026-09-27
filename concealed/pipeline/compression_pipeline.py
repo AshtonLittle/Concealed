@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Optional, Union, Dict, Any, Tuple
 from PIL import Image
 
-from .preformatting.formatter import ClientSideFormatter, PLATFORM_PROFILES
-from .compression.compressor import AdaptiveCompressor, CompressionResult
-from .counter_prevention.verifier import CounterPreventionVerifier, IngestionSimulationResult
+from concealed.preformatting.formatter import ClientSideFormatter, PLATFORM_PROFILES
+from concealed.compression.compressor import AdaptiveCompressor, CompressionResult
+from concealed.counter_prevention.verifier import CounterPreventionVerifier, IngestionSimulationResult
 
 
 class ConcealedPipeline:

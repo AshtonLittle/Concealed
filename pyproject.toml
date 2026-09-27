@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "concealed"
+version = "0.1.0"
+description = "Amortized Generator Network for Real-Time Image Obfuscation Against Vision Transformers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Ashton Little" }
+]
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "transformers>=4.38.0",
+    "timm>=0.9.12",
+    "pyyaml>=6.0",
+    "pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.66.0",
+    "onnx>=1.15.0",
+    "onnxruntime>=1.17.0",
+    "opencv-python>=4.8.0",
+]
+
+[project.optional-dependencies]
+perceptual = [
+    "lpips>=0.1.4",
+    "accelerate>=0.27.0",
+]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[project.scripts]
+concealed-train = "concealed.train:main"
+concealed-eval = "concealed.evaluate:main"
+concealed-export = "concealed.pipeline.export:main"
+concealed-infer = "concealed.pipeline.realtime:main"
+concealed-snowflake = "concealed.snowflake_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["concealed*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

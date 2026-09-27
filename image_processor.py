@@ -2,7 +2,7 @@
 """
 Concealed AI - Image Processor CLI
 Performs client-side pre-formatting, adaptive high-fidelity image compression,
-and platform counter-prevention verification.
+platform counter-prevention verification, and optional neural representation obfuscation.
 """
 
 from __future__ import annotations
@@ -12,13 +12,14 @@ import sys
 from pathlib import Path
 from PIL import Image
 
-from concealed.pipeline import ConcealedPipeline
+from concealed.pipeline import ConcealedPipeline, RealtimeObfuscator
 from concealed.preformatting.formatter import PLATFORM_PROFILES
+from concealed.models.generator import AmortizedObfuscationGenerator
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Concealed AI: Image Compression, Client-Side Pre-Formatting & Counter-Prevention Engine."
+        description="Concealed AI: Image Obfuscation, Compression, Client-Side Pre-Formatting & Counter-Prevention Engine."
     )
     parser.add_argument(
         "image_file",
@@ -29,7 +30,30 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output",
         type=str,
         default=None,
-        help="Optional destination path for the compressed image. (Default: <name>_compressed.<ext>)"
+        help="Optional destination path for the output image. (Default: <name>_processed.<ext>)"
+    )
+    parser.add_argument(
+        "--obfuscate",
+        action="store_true",
+        help="Apply real-time amortized neural representation obfuscation against Vision Transformers before compression."
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Path to generator checkpoint (.pt or .onnx). If omitted and --obfuscate is set, an initialized generator is used."
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=8.0,
+        help="Maximum L_inf perturbation bound in 0-255 scale (default: 8.0)."
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Compute device for neural obfuscation ('cpu' or 'cuda')."
     )
     parser.add_argument(
         "--platform",
@@ -89,21 +113,41 @@ def main() -> None:
         sys.exit(1)
 
     print("\n=======================================================")
-    print("      CONCEALED AI: COMPRESSION & PRE-FORMATTING       ")
+    print("      CONCEALED AI: OBFUSCATION & COMPRESSION ENGINE   ")
     print("=======================================================")
     print(f"[+] Input Photo: {input_path}")
 
     with Image.open(input_path) as im:
         orig_kb = round(input_path.stat().st_size / 1024.0, 2)
         print(f"    Source Resolution: {im.width}x{im.height} px | Mode: {im.mode} | Size: {orig_kb} KB")
+        working_img = im.convert("RGB")
 
-    print(f"[+] Client-Side Pre-Formatting Target: Platform '{args.platform}'")
+    # Step 1: Optional Neural Representation Obfuscation
+    if args.obfuscate:
+        print("\n[*] Applying Amortized Generator Neural Obfuscation...")
+        if args.model_path and Path(args.model_path).is_file():
+            obfuscator = RealtimeObfuscator(
+                model_path=args.model_path,
+                device=args.device,
+                epsilon_255=args.epsilon,
+            )
+        else:
+            gen = AmortizedObfuscationGenerator(epsilon=args.epsilon / 255.0)
+            obfuscator = RealtimeObfuscator(
+                model_path=gen,
+                device=args.device or "cpu",
+                epsilon_255=args.epsilon,
+            )
+        working_img = obfuscator.obfuscate_pil(working_img)
+        print(f"[OK] Neural Obfuscation Synthesized (L_inf <= {args.epsilon}/255)")
+
+    print(f"\n[+] Client-Side Pre-Formatting Target: Platform '{args.platform}'")
     print(f"    - Color standard: sRGB IEC61966-2.1 with embedded ICC profile")
     print(f"    - Resampling: High-order Lanczos interpolation")
     print(f"    - Privacy: Stripping all EXIF / GPS / device metadata")
     print(f"    - Fit mode: {args.fit_mode}")
 
-    print(f"[+] Compression Settings:")
+    print(f"\n[+] Compression Settings:")
     print(f"    - Format: {args.format.upper()}")
     print(f"    - Quality Factor: {args.quality if args.target_size_kb is None else f'Adaptive (target <= {args.target_size_kb} KB)'}")
     print(f"    - Chroma Subsampling: {args.chroma} ({'Pristine Color' if args.chroma == '444' else 'Bandwidth Saving'})")
@@ -118,21 +162,35 @@ def main() -> None:
         optimize=True,
     )
 
-    print("\n[*] Executing client-side pre-formatting and compression...")
-    saved_path, metrics = pipeline.process_image(
-        input_path=input_path,
-        output_path=args.output,
-        target_size_kb=args.target_size_kb,
-        quality=args.quality,
-        chroma_subsampling=args.chroma,
-        platform=args.platform,
-        verify_counter_prevention=not args.no_verify,
-    )
+    # Save intermediate working image to temporary location if obfuscated, or process directly
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_input = Path(tmpdir) / f"input_{input_path.name}"
+        working_img.save(temp_input, format="PNG")
 
-    print(f"\n[OK] Compression Completed Successfully!")
+        dest_output = args.output
+        if dest_output is None:
+            prefix = "concealed" if args.obfuscate else "compressed"
+            suffix = f".{args.format.lower()}"
+            if suffix == ".jpg":
+                suffix = ".jpeg"
+            dest_output = input_path.parent / f"{input_path.stem}_{prefix}{suffix}"
+
+        print("\n[*] Executing client-side pre-formatting and compression...")
+        saved_path, metrics = pipeline.process_image(
+            input_path=temp_input,
+            output_path=dest_output,
+            target_size_kb=args.target_size_kb,
+            quality=args.quality,
+            chroma_subsampling=args.chroma,
+            platform=args.platform,
+            verify_counter_prevention=not args.no_verify,
+        )
+
+    print(f"\n[OK] Processing Completed Successfully!")
     print(f"    Output File: {saved_path}")
     print(f"    Output Resolution: {metrics['formatted_resolution'][0]}x{metrics['formatted_resolution'][1]} px")
-    print(f"    Compressed Size: {metrics['compressed_file_size_kb']} KB ({metrics['compression_ratio_percent']}% reduction from raw buffer)")
+    print(f"    Compressed Size: {metrics['compressed_file_size_kb']} KB")
     print(f"    Quality Factor Used: Q={metrics['quality_factor']}")
     print(f"    Bits Per Pixel (bpp): {metrics['bits_per_pixel']}")
 
