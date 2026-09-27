@@ -13,19 +13,20 @@ import './App.css';
 export function App() {
   const [currentView, setCurrentView] = useState<AppView>('image');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(true);
   const [selectedImageModel, setSelectedImageModel] = useState<'onnx' | 'pt'>('onnx');
   const [concealStats, setConcealStats] = useState<ConcealStats | null>(null);
 
-  const isFeatureObscuring = currentView === 'feature-obscuring';
+  const isNoSidebarView = currentView === 'feature-obscuring' || currentView === 'probe';
 
   // When switching to video view, collapse settings and sidebar so video fits majority of screen
   useEffect(() => {
     if (currentView === 'video') {
       setIsSettingsOpen(false);
       setIsSidebarOpen(false);
-    } else {
+    } else if (currentView !== 'feature-obscuring' && currentView !== 'probe') {
       setIsSidebarOpen(true);
+      setIsSettingsOpen(true);
     }
   }, [currentView]);
 
@@ -43,8 +44,8 @@ export function App() {
       isSettingsOpen={isSettingsOpen}
       onToggleSettings={() => setIsSettingsOpen((prev) => !prev)}
     >
-      {/* Left Column: Statistics (hidden for feature obscuring) */}
-      {!isFeatureObscuring && (
+      {/* Left Column: Statistics (hidden for feature obscuring and model probe) */}
+      {!isNoSidebarView && (
         <Sidebar
           isOpen={isSidebarOpen}
           onToggle={() => setIsSidebarOpen((prev) => !prev)}
@@ -59,8 +60,8 @@ export function App() {
       {currentView === 'video' && <VideoWorkspace onProcessingStart={handleVideoProcessingStart} onStatsUpdate={setConcealStats} />}
       {currentView === 'probe' && <ProbeWorkspace selectedModelEngine={selectedImageModel} />}
 
-      {/* Right Column: Settings (hidden for feature obscuring) */}
-      {!isFeatureObscuring && (
+      {/* Right Column: Settings (hidden for feature obscuring and model probe) */}
+      {!isNoSidebarView && (
         <SettingsSidebar
           isOpen={isSettingsOpen}
           onToggle={() => setIsSettingsOpen((prev) => !prev)}
