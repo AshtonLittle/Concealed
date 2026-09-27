@@ -51,12 +51,12 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({
 
   const handleLoadSample = async () => {
     try {
-      const res = await fetch('/logo.png');
+      const res = await fetch('/test_image.jpg');
       const blob = await res.blob();
-      const file = new File([blob], 'logo.png', { type: 'image/png' });
+      const file = new File([blob], 'test_image.jpg', { type: 'image/jpeg' });
       handleSelectFile(file);
     } catch {
-      setErrorMsg('Could not load sample image.');
+      setErrorMsg('Could not load test image.');
     }
   };
 
@@ -252,7 +252,7 @@ export const ProbeWorkspace: React.FC<ProbeWorkspaceProps> = ({
                   handleLoadSample();
                 }}
               >
-                Use Sample Image
+                Use Test Image
               </button>
             </div>
           ) : (
