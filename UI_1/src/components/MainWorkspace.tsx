@@ -1,18 +1,22 @@
 import React from 'react';
 import { SettingsButton } from './SettingsButton';
-import { SettingsPanel } from './SettingsPanel';
+import { SettingsPanel, type ObfuscatorParameters } from './SettingsPanel';
 import { ProtectionStatus } from './ProtectionStatus';
 
 interface MainWorkspaceProps {
   isSettingsOpen: boolean;
   onToggleSettings: () => void;
   onCloseSettings: () => void;
+  parameters?: ObfuscatorParameters;
+  onChangeParameters?: (params: ObfuscatorParameters) => void;
 }
 
 export const MainWorkspace: React.FC<MainWorkspaceProps> = ({
   isSettingsOpen,
   onToggleSettings,
   onCloseSettings,
+  parameters,
+  onChangeParameters,
 }) => {
   return (
     <main className="main-workspace" aria-label="Main protection workspace">
@@ -24,15 +28,17 @@ export const MainWorkspace: React.FC<MainWorkspaceProps> = ({
         />
       </div>
 
-      {/* Centered Protection Symbol & Typography */}
+      {/* Centered Protection Symbol, Upload & Result */}
       <div className="workspace-content">
-        <ProtectionStatus />
+        <ProtectionStatus parameters={parameters} />
       </div>
 
       {/* Settings Dialog / Panel */}
       <SettingsPanel
         isOpen={isSettingsOpen}
         onClose={onCloseSettings}
+        parameters={parameters}
+        onChangeParameters={onChangeParameters}
       />
     </main>
   );

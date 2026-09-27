@@ -249,13 +249,30 @@ class ObfuscationService:
         self.device_str = device or ("cuda" if _TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
         self.torch_engine = None
         self.backend_name = "Algorithmic-DCT-Engine"
+        self.model_path = None
+
+        # Auto-discover latest_generator.pt if not explicitly provided
+        if checkpoint_path is None:
+            candidates = [
+                os.environ.get("CONCEALED_CHECKPOINT"),
+                "latest_generator.pt",
+                os.path.join(os.getcwd(), "latest_generator.pt"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "latest_generator.pt"),
+                "runs/exp1/best_generator.pt",
+            ]
+            for cand in candidates:
+                if cand and os.path.exists(cand):
+                    checkpoint_path = str(os.path.abspath(cand))
+                    break
 
         # Attempt to load PyTorch RealtimeObfuscator if available
         if _TORCH_AVAILABLE and checkpoint_path and os.path.exists(checkpoint_path):
             try:
                 from concealed.pipeline.realtime import RealtimeObfuscator
                 self.torch_engine = RealtimeObfuscator(checkpoint_path, device=self.device_str)
-                self.backend_name = f"PyTorch-{self.torch_engine.backend.upper()}"
+                self.model_path = checkpoint_path
+                self.backend_name = f"PyTorch-NeuralGenerator ({os.path.basename(checkpoint_path)})"
+                print(f"[ObfuscationService] Loaded neural generator from '{checkpoint_path}' on {self.device_str}")
             except Exception as e:
                 print(f"[ObfuscationService] Note: Could not load checkpoint ({e}), running algorithmic engine.")
 
@@ -265,6 +282,7 @@ class ObfuscationService:
             "status": "healthy",
             "backend": self.backend_name,
             "device": self.device_str,
+            "model_path": self.model_path,
             "torch_available": _TORCH_AVAILABLE,
             "scipy_available": _SCIPY_AVAILABLE,
             "torch_engine_active": self.torch_engine is not None,
@@ -363,10 +381,41 @@ class ObfuscationService:
         orig_w, orig_h = pil_input.size
 
         # Obfuscation step: Neural Generator or Algorithmic Engine
-        if self.torch_engine is not None:
-            # PyTorch pipeline
-            obf_pil = self.torch_engine.obfuscate_pil(pil_input)
-            obf_rgb = np.array(obf_pil.convert("RGB"), dtype=np.uint8)
+        if self.torch_engine is not None and getattr(self.torch_engine, "generator", None) is not None:
+            try:
+                gen = self.torch_engine.generator
+                if hasattr(gen, "set_epsilon_255"):
+                    gen.set_epsilon_255(float(params.epsilon))
+
+                tensor_in = torch.from_numpy(clean_rgb).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(self.torch_engine.device)
+
+                with torch.no_grad():
+                    obf_t, delta_t = gen(tensor_in, return_delta=True)
+
+                    # Chroma damping
+                    if params.chroma_damping > 0.0:
+                        delta_np = (delta_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0)
+                        delta_np = _apply_chroma_damping(delta_np, params.chroma_damping)
+                        delta_t = torch.from_numpy(delta_np).permute(2, 0, 1).unsqueeze(0).div(255.0).to(self.torch_engine.device)
+
+                    # Conforming mask
+                    if params.conforming_mask or params.target_features:
+                        conf_mask = _generate_conforming_mask(
+                            clean_rgb,
+                            target_features=params.target_features,
+                            feather_radius=params.feather_radius,
+                        )
+                        mask_t = torch.from_numpy(conf_mask).permute(2, 0, 1).unsqueeze(0).to(self.torch_engine.device).float()
+                        delta_t = delta_t * mask_t
+
+                    obf_tensor = torch.clamp(tensor_in + delta_t, 0.0, 1.0)
+                    obf_rgb = (obf_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+                    obf_pil = Image.fromarray(obf_rgb)
+            except Exception as e:
+                print(f"[ObfuscationService] Generator forward error ({e}), falling back to algorithmic engine.")
+                delta = self._synthesize_delta(clean_rgb, params)
+                obf_rgb = np.clip(clean_rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
+                obf_pil = Image.fromarray(obf_rgb)
         else:
             # Algorithmic DCT Engine
             delta = self._synthesize_delta(clean_rgb, params)

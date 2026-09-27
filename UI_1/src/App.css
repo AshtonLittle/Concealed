@@ -1142,6 +1142,242 @@
 }
 
 /* ==========================================================================
+   Live Processing Action, Result Comparison & Telemetry
+   ========================================================================== */
+.dropbox-image-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #3f3f46;
+  flex-shrink: 0;
+}
+
+.process-action-area {
+  margin-top: 18px;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+}
+
+.conceal-process-btn {
+  padding: 12px 32px;
+  background-color: #ffffff;
+  color: #121214;
+  border: 1px solid #ffffff;
+  border-radius: 9px;
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  box-shadow: 0 4px 20px rgba(255, 255, 255, 0.15);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.conceal-process-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background-color: #f4f4f5;
+  box-shadow: 0 6px 24px rgba(255, 255, 255, 0.25);
+}
+
+.conceal-process-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.conceal-process-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.btn-spinner-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid #27272a;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.process-error-notice {
+  margin-top: 14px;
+  padding: 10px 16px;
+  background-color: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 8px;
+  color: #fca5a5;
+  font-size: 12px;
+  max-width: 540px;
+  text-align: center;
+  line-height: 1.4;
+}
+
+/* Obfuscation Result View */
+.obfuscation-result-container {
+  width: 100%;
+  max-width: 600px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  animation: fadeIn 0.25s ease;
+}
+
+.result-view-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.result-toggle-group {
+  display: flex;
+  background-color: #17171a;
+  border: 1px solid #32323a;
+  border-radius: 8px;
+  padding: 3px;
+  gap: 3px;
+}
+
+.result-toggle-btn {
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 6px;
+  color: #8c8c92;
+  background: transparent;
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.result-toggle-btn.active {
+  background-color: #2c2c31;
+  color: #ffffff;
+  font-weight: 600;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+.result-close-btn {
+  padding: 6px 14px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #a1a1aa;
+  background-color: transparent;
+  border: 1px solid #383840;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.result-close-btn:hover {
+  background-color: #27272a;
+  color: #ffffff;
+}
+
+.result-image-box {
+  width: 100%;
+  max-height: 380px;
+  background-color: #141416;
+  border: 1px solid #2d2d34;
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+}
+
+.result-preview-image {
+  max-width: 100%;
+  max-height: 380px;
+  object-fit: contain;
+  display: block;
+}
+
+/* Telemetry Badges */
+.result-telemetry-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.telemetry-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 6px 14px;
+  background-color: #1f1f23;
+  border: 1px solid #33333a;
+  border-radius: 7px;
+  min-width: 80px;
+}
+
+.telemetry-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #71717a;
+}
+
+.telemetry-value {
+  font-size: 13px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: #e4e4e7;
+  margin-top: 1px;
+}
+
+.telemetry-value.highlight {
+  color: #38bdf8;
+}
+
+.result-actions-row {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.conceal-download-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 24px;
+  background-color: #27272a;
+  border: 1px solid #3f3f46;
+  border-radius: 8px;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: all 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.conceal-download-btn:hover {
+  background-color: #3f3f46;
+  border-color: #52525b;
+}
+
+/* ==========================================================================
    Minimized Dock Item
    ========================================================================== */
 .minimized-dock-container {
