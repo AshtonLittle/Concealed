@@ -55,7 +55,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="statistic-card">
           <span className="statistic-card-label">AI PRIVACY SHIELD</span>
           <div className="statistic-metric-value">
-            <span className="metric-number">99.4</span>
+            <span className="metric-number">{currentView === 'probe' ? '99.8' : '99.4'}</span>
             <span className="metric-unit">%</span>
           </div>
         </div>
@@ -64,7 +64,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="statistic-card">
           <span className="statistic-card-label">TOTAL QUALITY LOSS</span>
           <div className="statistic-metric-value">
-            <span className="metric-number">1.8</span>
+            <span className="metric-number">{currentView === 'probe' ? '1.2' : '1.8'}</span>
             <span className="metric-unit">%</span>
           </div>
         </div>
@@ -82,7 +82,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="statistic-card">
           <span className="statistic-card-label">LATENCY</span>
           <div className="statistic-metric-value">
-            <span className="metric-number">{currentView === 'video' ? '33' : '138'}</span>
+            <span className="metric-number">
+              {currentView === 'video' ? '33' : currentView === 'probe' ? '42' : '138'}
+            </span>
             <span className="metric-unit">ms</span>
           </div>
         </div>

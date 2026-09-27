@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from concealed.api.schemas import (
     HealthResponse,
+    ModelProbeSpec,
+    ModelsCatalogResponse,
     ObfuscationAnalytics,
     ObfuscationJSONRequest,
     ObfuscationJSONResponse,
@@ -18,7 +20,9 @@ from concealed.api.schemas import (
     OutputFormatEnum,
     ParameterSpec,
     ParametersInfoResponse,
+    ProbeResponse,
     ResponseTypeEnum,
+    SiglipProbeResponse,
     SynthesisModeEnum,
 )
 from concealed.api.service import ObfuscationService
@@ -39,6 +43,120 @@ async def health_check() -> HealthResponse:
         supported_formats=["PNG", "JPEG", "WEBP"],
         supported_modes=["hybrid", "canonical_residual", "native"],
     )
+
+
+@router.get("/models", response_model=ModelsCatalogResponse)
+async def get_models_catalog() -> ModelsCatalogResponse:
+    """Return available generator model checkpoints and view defaults."""
+    catalog = service.get_available_models()
+    return ModelsCatalogResponse(**catalog)
+
+
+@router.post("/models/select")
+async def select_image_model(model_id: str = Form(..., description="'onnx' or 'pt'")) -> Dict[str, Any]:
+    """Set the active default model used for image obfuscation."""
+    chosen = service.set_active_image_model(model_id)
+    return {"status": "success", "active_image_model": chosen}
+
+
+@router.get("/probe/models", response_model=List[ModelProbeSpec])
+async def get_probe_models() -> List[ModelProbeSpec]:
+    """Return list of Vision Transformer models available to probe and audit."""
+    return service.probe_service.get_probe_catalog()
+
+
+@router.post("/probe", response_model=ProbeResponse)
+async def probe_transformer_models(
+    file: UploadFile = File(..., description="Clean or reference image to test"),
+    obfuscated_file: Optional[UploadFile] = File(None, description="Optional pre-obfuscated image file"),
+    prompt: str = Form("Describe the content of the image.", description="Query prompt for the Vision Transformers"),
+    models: Optional[str] = Form(None, description="Comma-separated model IDs to probe, or 'all'"),
+    model_engine: Optional[str] = Form("onnx", description="Model engine used if auto-generating obfuscated counterpart"),
+) -> ProbeResponse:
+    """Probe Vision Transformers and VLMs with a text prompt on Clean vs Concealed image."""
+    try:
+        clean_bytes = await file.read()
+        if not clean_bytes:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty.")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error reading image: {e}") from e
+
+    obf_bytes = None
+    if obfuscated_file is not None:
+        try:
+            obf_bytes = await obfuscated_file.read()
+        except Exception:
+            obf_bytes = None
+
+    model_id_list = [m.strip() for m in models.split(",")] if models and models.strip() else None
+
+    try:
+        res = service.probe_image(
+            clean_image_bytes=clean_bytes,
+            obfuscated_image_bytes=obf_bytes,
+            prompt=prompt,
+            model_ids=model_id_list,
+            model_engine=model_engine,
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Model probe evaluation failed: {e}",
+        ) from e
+
+
+@router.post("/probe/siglip", response_model=SiglipProbeResponse)
+async def probe_siglip_options(
+    file: UploadFile = File(..., description="Clean or reference image to test"),
+    obfuscated_file: Optional[UploadFile] = File(None, description="Optional pre-obfuscated image file"),
+    options: str = Form("face, person, readable text, dog, car", description="Comma-separated or JSON list of options to test"),
+    model_engine: Optional[str] = Form("onnx", description="Model engine used if auto-generating obfuscated counterpart"),
+) -> SiglipProbeResponse:
+    """Probe user options with real Google SigLIP comparing Clean vs Concealed image."""
+    try:
+        clean_bytes = await file.read()
+        if not clean_bytes:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty.")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error reading image: {e}") from e
+
+    obf_bytes = None
+    if obfuscated_file is not None:
+        try:
+            obf_bytes = await obfuscated_file.read()
+        except Exception:
+            obf_bytes = None
+
+    # Parse options (comma-separated or JSON list)
+    opts_list: List[str] = []
+    if options:
+        opt_str = options.strip()
+        if opt_str.startswith("[") and opt_str.endswith("]"):
+            try:
+                opts_list = json.loads(opt_str)
+            except Exception:
+                opts_list = [o.strip() for o in opt_str.strip("[]").split(",") if o.strip()]
+        else:
+            opts_list = [o.strip() for o in opt_str.split(",") if o.strip()]
+
+    if not opts_list:
+        opts_list = ["face", "person", "readable text", "dog", "car"]
+
+    try:
+        res = service.probe_options_siglip(
+            clean_image_bytes=clean_bytes,
+            obfuscated_image_bytes=obf_bytes,
+            options=opts_list,
+            model_engine=model_engine,
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"SigLIP evaluation failed: {e}",
+        ) from e
+
 
 
 @router.get("/parameters", response_model=ParametersInfoResponse)
@@ -171,6 +289,7 @@ async def obfuscate_image_upload(
     canonical_size: int = Form(384, ge=128, le=1024, description="Canonical residual size"),
     hybrid_global_weight: float = Form(0.60, ge=0.0, le=1.0, description="Global vs tile weight"),
     response_type: ResponseTypeEnum = Form(ResponseTypeEnum.IMAGE, description="Return binary image or JSON"),
+    model_engine: Optional[str] = Form("auto", description="Model engine: 'onnx', 'pt', or 'auto'"),
 ) -> Response:
     """Upload an image, configure all obfuscation parameters, and receive the processed image back."""
     # Read uploaded file
@@ -203,6 +322,7 @@ async def obfuscate_image_upload(
         canonical_size=canonical_size,
         hybrid_global_weight=hybrid_global_weight,
         response_type=response_type,
+        model_engine=model_engine,
     )
 
     # Execute obfuscation

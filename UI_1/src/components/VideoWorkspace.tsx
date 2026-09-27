@@ -35,10 +35,13 @@ export interface VideoAnalytics {
   avg_ssim: number;
 }
 
-export type ViewportMode = 'slider' | 'side-by-side' | 'concealed' | 'original' | 'difference';
-export type WorkspaceTab = 'visualizer' | 'video-player';
+export type VideoTab = 'concealed' | 'original' | 'side-by-side';
 
-export const VideoWorkspace: React.FC = () => {
+interface VideoWorkspaceProps {
+  onProcessingStart?: () => void;
+}
+
+export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({ onProcessingStart }) => {
   // Input Video Selection States
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
@@ -58,86 +61,47 @@ export const VideoWorkspace: React.FC = () => {
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Results & Frame Visualizer States
-  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('visualizer');
-  const [viewportMode, setViewportMode] = useState<ViewportMode>('slider');
-  const [sliderPos, setSliderPos] = useState<number>(50);
-  const [isDraggingSlider, setIsDraggingSlider] = useState<boolean>(false);
-
-  const [frames, setFrames] = useState<FrameItem[]>([]);
-  const [activeFrameIdx, setActiveFrameIdx] = useState<number>(0);
-  const [isPlayingSlideshow, setIsPlayingSlideshow] = useState<boolean>(false);
-  const [slideshowFps, setSlideshowFps] = useState<number>(4);
-
-  // Reconstructed Video Player States
+  // The Two Videos & Tab State
   const [concealedVideoUrl, setConcealedVideoUrl] = useState<string | null>(null);
-  const [videoPlayerSource, setVideoPlayerSource] = useState<'concealed' | 'original'>('concealed');
+  const [activeVideoTab, setActiveVideoTab] = useState<VideoTab>('concealed');
   const [metadata, setMetadata] = useState<VideoMetadata | null>(null);
   const [analytics, setAnalytics] = useState<VideoAnalytics | null>(null);
-  const [engineBackend, setEngineBackend] = useState<string>('ONNXRuntime (generator.onnx)');
+  const [engineBackend, setEngineBackend] = useState<string>('ONNX Runtime (generator.onnx)');
+  const [frames, setFrames] = useState<FrameItem[]>([]);
 
   // DOM Refs
   const videoInputRef = useRef<HTMLInputElement>(null);
-  const sliderContainerRef = useRef<HTMLDivElement>(null);
-  const filmstripRef = useRef<HTMLDivElement>(null);
-  const slideshowTimerRef = useRef<number | null>(null);
+  const originalVideoRef = useRef<HTMLVideoElement>(null);
+  const concealedVideoRef = useRef<HTMLVideoElement>(null);
 
   // Clean up object URLs
   useEffect(() => {
     return () => {
       if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
-      if (concealedVideoUrl) URL.revokeObjectURL(concealedVideoUrl);
+      if (concealedVideoUrl && concealedVideoUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(concealedVideoUrl);
+      }
     };
   }, [videoPreviewUrl, concealedVideoUrl]);
 
-  // Slideshow auto-play effect
-  useEffect(() => {
-    if (isPlayingSlideshow && frames.length > 1) {
-      const interval = Math.max(40, 1000 / slideshowFps);
-      slideshowTimerRef.current = window.setInterval(() => {
-        setActiveFrameIdx((prev) => (prev + 1) % frames.length);
-      }, interval);
-    } else {
-      if (slideshowTimerRef.current) {
-        clearInterval(slideshowTimerRef.current);
-        slideshowTimerRef.current = null;
-      }
+  // Synchronize playback when in side-by-side mode
+  const handleOriginalPlay = () => {
+    if (activeVideoTab === 'side-by-side' && concealedVideoRef.current && concealedVideoRef.current.paused) {
+      concealedVideoRef.current.play().catch(() => {});
     }
-    return () => {
-      if (slideshowTimerRef.current) {
-        clearInterval(slideshowTimerRef.current);
-      }
-    };
-  }, [isPlayingSlideshow, frames.length, slideshowFps]);
+  };
 
-  // Auto-scroll active thumbnail into view
-  useEffect(() => {
-    if (filmstripRef.current && frames.length > 0) {
-      const activeEl = filmstripRef.current.children[activeFrameIdx] as HTMLElement;
-      if (activeEl) {
-        activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
-      }
+  const handleOriginalPause = () => {
+    if (activeVideoTab === 'side-by-side' && concealedVideoRef.current && !concealedVideoRef.current.paused) {
+      concealedVideoRef.current.pause();
     }
-  }, [activeFrameIdx, frames.length]);
+  };
 
-  // Keyboard navigation for frames
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (frames.length === 0 || isProcessing) return;
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        setActiveFrameIdx((prev) => Math.max(0, prev - 1));
-      } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        setActiveFrameIdx((prev) => Math.min(frames.length - 1, prev + 1));
-      } else if (e.key === ' ') {
-        e.preventDefault();
-        setIsPlayingSlideshow((prev) => !prev);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [frames.length, isProcessing]);
+  const handleOriginalSeek = () => {
+    if (activeVideoTab === 'side-by-side' && originalVideoRef.current && concealedVideoRef.current) {
+      concealedVideoRef.current.currentTime = originalVideoRef.current.currentTime;
+    }
+  };
 
   // Drag & drop handlers
   const handleDragOver = (e: React.DragEvent) => {
@@ -150,19 +114,23 @@ export const VideoWorkspace: React.FC = () => {
   };
 
   const processVideoFile = useCallback(async (file: File) => {
+    // Notify parent to collapse settings sidebar so screen space is maximized
+    if (onProcessingStart) {
+      onProcessingStart();
+    }
+
     setSelectedVideo(file);
     const prevUrl = URL.createObjectURL(file);
     setVideoPreviewUrl(prevUrl);
     setConcealedVideoUrl(null);
     setFrames([]);
-    setActiveFrameIdx(0);
     setMetadata(null);
     setAnalytics(null);
     setErrorMsg(null);
     setIsProcessing(true);
     setProgressPercent(5);
     setProcessedCount(0);
-    setStatusMessage('Decompressing video stream & extracting keyframes...');
+    setStatusMessage('Decompressing video stream & extracting frames...');
 
     const formData = new FormData();
     formData.append('file', file);
@@ -172,7 +140,7 @@ export const VideoWorkspace: React.FC = () => {
     formData.append('frame_step', '1');
 
     try {
-      // Step 1: Attempt real-time SSE stream
+      // Step 1: Real-time SSE stream with ONNX acceleration
       setStatusMessage('Initializing ONNX neural generator stream...');
       const streamRes = await fetch('http://127.0.0.1:8001/api/obfuscate/video/stream-frames', {
         method: 'POST',
@@ -206,7 +174,7 @@ export const VideoWorkspace: React.FC = () => {
                 setMetadata(meta);
                 setTargetCount(meta.frames_to_process || maxFrames);
                 if (meta.engine) setEngineBackend(meta.engine);
-                setStatusMessage(`Decomposing video into frames • Active ONNX Model: ${meta.engine || 'generator.onnx'}`);
+                setStatusMessage(`Decomposing video • Active Engine: ${meta.engine || 'generator.onnx'}`);
               } else if (event.type === 'frame') {
                 const newFrame: FrameItem = event.frame;
                 setFrames((prev) => [...prev, newFrame]);
@@ -232,25 +200,26 @@ export const VideoWorkspace: React.FC = () => {
                   setEngineBackend(res.engine);
                 }
                 setProgressPercent(100);
-                setStatusMessage('All video frames shielded & reconstructed with ONNX.');
+                setStatusMessage('Video obfuscation complete. Ready for playback.');
+                setActiveVideoTab('concealed');
               } else if (event.type === 'error') {
                 throw new Error(event.message || 'Stream processing error');
               }
             } catch (jsonErr: unknown) {
-              console.warn('SSE JSON parse chunk skip:', jsonErr);
+              console.warn('SSE chunk skipped:', jsonErr);
             }
           }
         }
       } else {
         // Fallback to standard batch JSON endpoint
-        setStatusMessage('Streaming fallback: Processing full frame sequence via fast ONNX...');
+        setStatusMessage('Processing video frames via ONNX...');
         const batchRes = await fetch('http://127.0.0.1:8001/api/obfuscate/video/frames', {
           method: 'POST',
           body: formData,
         });
 
         if (!batchRes.ok) {
-          let detail = 'Video frame obfuscation failed.';
+          let detail = 'Video obfuscation failed.';
           try {
             const errJson = await batchRes.json();
             detail = errJson.detail || detail;
@@ -275,7 +244,8 @@ export const VideoWorkspace: React.FC = () => {
           setEngineBackend(resData.engine);
         }
         setProgressPercent(100);
-        setStatusMessage('Video frame processing complete.');
+        setStatusMessage('Video processing complete.');
+        setActiveVideoTab('concealed');
       }
     } catch (err: unknown) {
       console.error('Video obfuscation error:', err);
@@ -284,7 +254,7 @@ export const VideoWorkspace: React.FC = () => {
     } finally {
       setIsProcessing(false);
     }
-  }, [epsilon, mode, maxFrames]);
+  }, [epsilon, mode, maxFrames, onProcessingStart]);
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -299,10 +269,10 @@ export const VideoWorkspace: React.FC = () => {
           setVideoPreviewUrl(URL.createObjectURL(file));
           setConcealedVideoUrl(null);
           setFrames([]);
-          setMetadata(null);
-          setAnalytics(null);
           setErrorMsg(null);
         }
+      } else {
+        setErrorMsg('Please upload a valid video file (.mp4, .webm, .mov).');
       }
     }
   };
@@ -317,8 +287,6 @@ export const VideoWorkspace: React.FC = () => {
         setVideoPreviewUrl(URL.createObjectURL(file));
         setConcealedVideoUrl(null);
         setFrames([]);
-        setMetadata(null);
-        setAnalytics(null);
         setErrorMsg(null);
       }
     }
@@ -331,888 +299,488 @@ export const VideoWorkspace: React.FC = () => {
   const clearVideo = (e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     setSelectedVideo(null);
-    if (videoPreviewUrl) {
-      URL.revokeObjectURL(videoPreviewUrl);
-      setVideoPreviewUrl(null);
-    }
-    if (concealedVideoUrl) {
+    if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
+    setVideoPreviewUrl(null);
+    if (concealedVideoUrl && concealedVideoUrl.startsWith('blob:')) {
       URL.revokeObjectURL(concealedVideoUrl);
-      setConcealedVideoUrl(null);
     }
+    setConcealedVideoUrl(null);
     setFrames([]);
-    setActiveFrameIdx(0);
     setMetadata(null);
     setAnalytics(null);
     setErrorMsg(null);
     setIsProcessing(false);
-    setIsPlayingSlideshow(false);
     if (videoInputRef.current) {
       videoInputRef.current.value = '';
     }
   };
 
-  // Slider Mouse/Touch Drag Handlers
-  const handleSliderMove = useCallback((clientX: number) => {
-    if (!sliderContainerRef.current) return;
-    const rect = sliderContainerRef.current.getBoundingClientRect();
-    const x = clientX - rect.left;
-    const pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
-    setSliderPos(Math.round(pct));
-  }, []);
-
-  const handleMouseDown = () => setIsDraggingSlider(true);
-  const handleTouchStart = () => setIsDraggingSlider(true);
-
-  useEffect(() => {
-    const handleMouseUp = () => setIsDraggingSlider(false);
-    const handleMouseMove = (e: MouseEvent) => {
-      if (isDraggingSlider) handleSliderMove(e.clientX);
-    };
-    const handleTouchMove = (e: TouchEvent) => {
-      if (isDraggingSlider && e.touches.length > 0) {
-        handleSliderMove(e.touches[0].clientX);
-      }
-    };
-
-    if (isDraggingSlider) {
-      window.addEventListener('mousemove', handleMouseMove);
-      window.addEventListener('mouseup', handleMouseUp);
-      window.addEventListener('touchmove', handleTouchMove);
-      window.addEventListener('touchend', handleMouseUp);
-    }
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-      window.removeEventListener('touchmove', handleTouchMove);
-      window.removeEventListener('touchend', handleMouseUp);
-    };
-  }, [isDraggingSlider, handleSliderMove]);
-
-  // Download Handlers
   const downloadConcealedVideo = () => {
     if (!concealedVideoUrl) return;
     const a = document.createElement('a');
     a.href = concealedVideoUrl;
-    a.download = `concealed_${selectedVideo?.name || 'video.mp4'}`;
+    a.download = `concealed_${selectedVideo?.name ? selectedVideo.name.replace(/\.[^/.]+$/, '') : 'video'}.mp4`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   };
 
-  const downloadActiveFrame = () => {
-    const frame = frames[activeFrameIdx];
-    if (!frame) return;
-    const a = document.createElement('a');
-    a.href = frame.obfuscated_image;
-    a.download = `frame_${frame.sequence_number}_obfuscated.jpg`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  const downloadDifferenceMap = () => {
-    const frame = frames[activeFrameIdx];
-    if (!frame || !frame.difference_image) return;
-    const a = document.createElement('a');
-    a.href = frame.difference_image;
-    a.download = `frame_${frame.sequence_number}_perturbation_map.jpg`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  const activeFrame: FrameItem | undefined = frames[activeFrameIdx];
+  const hasResults = Boolean((concealedVideoUrl || frames.length > 0) && !isProcessing);
 
   return (
-    <main className="main-workspace video-workspace-root" aria-label="Video protection workspace">
-      <div className="workspace-content">
-        <div className="protection-status-center" aria-live="polite">
+    <main className="video-workspace-screen-wrapper" aria-label="Video protection workspace">
+      <div className="video-workspace-screen-container">
 
-          {/* Top Video Drop Box (Visible when not yet processing, or minimal bar when results exist) */}
-          {!frames.length && !isProcessing && (
-            <>
-              <div
-                className={`image-dropbox video-dropbox ${isDragging ? 'is-dragging' : ''} ${selectedVideo ? 'has-file' : ''}`}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                onClick={triggerVideoInput}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    triggerVideoInput();
-                  }
-                }}
-                aria-label="Select a video file to break into frames and obfuscate"
-              >
-                <input
-                  type="file"
-                  ref={videoInputRef}
-                  onChange={handleFileChange}
-                  accept="video/*"
-                  className="dropbox-hidden-input"
-                  aria-hidden="true"
-                />
+        {/* =========================================================================
+            STATE 1: INITIAL UPLOAD & SETTINGS (FIT MAJORITY OF SCREEN)
+            ========================================================================= */}
+        {!hasResults && !isProcessing && (
+          <div className="video-upload-screen-section">
+            {/* Header info */}
+            <div className="video-screen-headline-block">
+              <span className="video-badge-pill">
+                <span className="video-badge-dot" />
+                REAL-TIME ONNX VIDEO OBFUSCATION
+              </span>
+              <h1 className="video-screen-main-title">Shield Video From Vision Transformers</h1>
+              <p className="video-screen-subtitle">
+                Decomposes video into individual frames, processes each frame with high-speed quantized ONNX Runtime,
+                and outputs protected video undetectable by frontier AI models.
+              </p>
+            </div>
 
-                {selectedVideo ? (
-                  <div className="dropbox-file-info video-file-info">
-                    {videoPreviewUrl ? (
-                      <video
-                        src={videoPreviewUrl}
-                        className="video-inline-preview"
-                        controls
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                    ) : (
-                      <svg
-                        className="dropbox-file-icon"
-                        viewBox="0 0 24 24"
-                        width="36"
-                        height="36"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" />
-                        <line x1="7" y1="2" x2="7" y2="22" />
-                        <line x1="17" y1="2" x2="17" y2="22" />
-                        <line x1="2" y1="12" x2="22" y2="12" />
-                        <line x1="2" y1="7" x2="7" y2="7" />
-                        <line x1="2" y1="17" x2="7" y2="17" />
-                      </svg>
-                    )}
-                    <div className="dropbox-file-details">
-                      <span className="dropbox-filename">{selectedVideo.name}</span>
-                      <span className="dropbox-filesize">
-                        {(selectedVideo.size / (1024 * 1024)).toFixed(2)} MB • Ready for Frame Decomposition
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      className="dropbox-clear-btn"
-                      onClick={clearVideo}
-                      title="Remove selected video"
-                      aria-label="Remove selected video"
-                    >
-                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <line x1="18" y1="6" x2="6" y2="18" />
-                        <line x1="6" y1="6" x2="18" y2="18" />
-                      </svg>
-                    </button>
+            {/* Large Wide Video Drop Box */}
+            <div
+              className={`video-large-dropbox ${isDragging ? 'is-dragging' : ''} ${selectedVideo ? 'has-file' : ''}`}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              onClick={triggerVideoInput}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  triggerVideoInput();
+                }
+              }}
+              aria-label="Select a video file to obfuscate"
+            >
+              <input
+                type="file"
+                ref={videoInputRef}
+                onChange={handleFileChange}
+                accept="video/*"
+                className="dropbox-hidden-input"
+                aria-hidden="true"
+              />
+
+              {selectedVideo ? (
+                <div className="video-selected-file-card" onClick={(e) => e.stopPropagation()}>
+                  {videoPreviewUrl && (
+                    <video
+                      src={videoPreviewUrl}
+                      className="video-selected-inline-preview"
+                      controls
+                    />
+                  )}
+                  <div className="video-selected-meta">
+                    <span className="video-selected-filename">{selectedVideo.name}</span>
+                    <span className="video-selected-filesize">
+                      {(selectedVideo.size / (1024 * 1024)).toFixed(2)} MB • Ready for ONNX Decomposition
+                    </span>
                   </div>
-                ) : (
-                  <div className="dropbox-content">
-                    <svg
-                      className="dropbox-upload-icon"
-                      viewBox="0 0 24 24"
-                      width="44"
-                      height="44"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
+                  <button
+                    type="button"
+                    className="video-selected-remove-btn"
+                    onClick={clearVideo}
+                    title="Remove selected video"
+                    aria-label="Remove selected video"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ) : (
+                <div className="video-dropbox-empty-content">
+                  <div className="video-upload-icon-circle">
+                    <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                       <polygon points="23 7 16 12 23 17 23 7" />
                       <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
                     </svg>
-                    <span className="dropbox-prompt-title">Select or drop a video file</span>
-                    <span className="dropbox-prompt-subtitle">Breaks video into frames & shields with high-speed ONNX model</span>
                   </div>
-                )}
-              </div>
-
-              {/* Fast Settings Controls before processing */}
-              <div className="video-options-bar" role="group" aria-label="Video Frame Extraction Settings">
-                <div className="video-option-pill">
-                  <span className="option-pill-label">FRAME SAMPLE</span>
-                  <div className="option-segmented">
-                    {[12, 24, 48].map((count) => (
-                      <button
-                        key={count}
-                        type="button"
-                        className={`opt-btn ${maxFrames === count ? 'active' : ''}`}
-                        onClick={() => setMaxFrames(count)}
-                      >
-                        {count}f
-                      </button>
-                    ))}
-                  </div>
+                  <span className="video-dropbox-prompt-title">Drop your video file here or click to browse</span>
+                  <span className="video-dropbox-prompt-sub">Supports MP4, WebM, MOV, and AVI • Optimized with generator.onnx</span>
                 </div>
+              )}
+            </div>
 
-                <div className="video-option-pill">
-                  <span className="option-pill-label">BUDGET ε</span>
-                  <div className="option-segmented">
-                    {[4, 8, 12].map((eps) => (
-                      <button
-                        key={eps}
-                        type="button"
-                        className={`opt-btn ${epsilon === eps ? 'active' : ''}`}
-                        onClick={() => setEpsilon(eps)}
-                      >
-                        {eps}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="video-option-pill">
-                  <span className="option-pill-label">SYNTHESIS</span>
-                  <div className="option-segmented">
-                    {[
-                      { id: 'hybrid', label: 'Hybrid' },
-                      { id: 'canonical_residual', label: 'Canonical' },
-                      { id: 'native', label: 'Native' },
-                    ].map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        className={`opt-btn ${mode === m.id ? 'active' : ''}`}
-                        onClick={() => setMode(m.id)}
-                      >
-                        {m.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="video-option-pill">
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '11px', color: '#c0c0cb' }}>
-                    <input
-                      type="checkbox"
-                      checked={autoStartOnDrop}
-                      onChange={(e) => setAutoStartOnDrop(e.target.checked)}
-                      style={{ accentColor: '#00f5a0', cursor: 'pointer' }}
-                    />
-                    <span>Auto-run on Drop</span>
-                  </label>
-                </div>
-
-                <div className="video-option-pill">
-                  <span className="option-pill-label">ENGINE</span>
-                  <span className="engine-chip-pill">ONNX Runtime</span>
+            {/* Quick Settings Bar */}
+            <div className="video-screen-options-bar" role="group" aria-label="Video Frame Extraction Settings">
+              <div className="video-screen-option-pill">
+                <span className="option-label">FRAME SAMPLE</span>
+                <div className="option-btn-segmented">
+                  {[12, 24, 48].map((count) => (
+                    <button
+                      key={count}
+                      type="button"
+                      className={`opt-chip-btn ${maxFrames === count ? 'active' : ''}`}
+                      onClick={() => setMaxFrames(count)}
+                    >
+                      {count}f
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              {/* Primary Action Button */}
-              <div className="workspace-action-row" style={{ marginTop: '14px' }}>
+              <div className="video-screen-option-pill">
+                <span className="option-label">BUDGET (ε)</span>
+                <div className="option-btn-segmented">
+                  {[4, 8, 12].map((eps) => (
+                    <button
+                      key={eps}
+                      type="button"
+                      className={`opt-chip-btn ${epsilon === eps ? 'active' : ''}`}
+                      onClick={() => setEpsilon(eps)}
+                    >
+                      {eps}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="video-screen-option-pill">
+                <span className="option-label">SYNTHESIS</span>
+                <div className="option-btn-segmented">
+                  {[
+                    { id: 'hybrid', label: 'Hybrid' },
+                    { id: 'canonical_residual', label: 'Canonical' },
+                    { id: 'native', label: 'Native' },
+                  ].map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      className={`opt-chip-btn ${mode === m.id ? 'active' : ''}`}
+                      onClick={() => setMode(m.id)}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="video-screen-option-pill">
+                <label className="option-checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={autoStartOnDrop}
+                    onChange={(e) => setAutoStartOnDrop(e.target.checked)}
+                    className="option-checkbox"
+                  />
+                  <span>Auto-run on Drop</span>
+                </label>
+              </div>
+
+              <div className="video-screen-option-pill engine-pill">
+                <span className="engine-status-dot" />
+                <span className="engine-text">ONNX Runtime (Fastest)</span>
+              </div>
+            </div>
+
+            {/* Large Primary Action Button */}
+            <div className="video-screen-action-row">
+              <button
+                type="button"
+                className="video-screen-pushbutton"
+                onClick={() => (selectedVideo ? processVideoFile(selectedVideo) : triggerVideoInput())}
+                disabled={isProcessing}
+                aria-label={selectedVideo ? "Obfuscate video frames using ONNX" : "Select video to obfuscate"}
+              >
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="23 7 16 12 23 17 23 7" />
+                  <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                </svg>
+                <span>{selectedVideo ? 'OBFUSCATE VIDEO FRAMES (ONNX ACCELERATED)' : 'SELECT VIDEO & OBFUSCATE'}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* =========================================================================
+            STATE 2: PROCESSING SCREEN (WIDE-SCREEN RADAR)
+            ========================================================================= */}
+        {isProcessing && (
+          <div className="video-screen-processing-card" role="status" aria-live="polite">
+            <div className="video-processing-header">
+              <div className="processing-engine-pill">
+                <span className="radar-pulse-dot" />
+                <span>ONNX RUNTIME ACCELERATED (60 FPS)</span>
+              </div>
+              <span className="processing-count-label">
+                {processedCount} / {targetCount} FRAMES PROCESSED
+              </span>
+            </div>
+
+            <div className="video-progress-track">
+              <div
+                className="video-progress-fill"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+
+            <div className="video-processing-status-message">
+              <div className="video-spinner" />
+              <span>{statusMessage}</span>
+            </div>
+
+            {/* Live Frame Chips */}
+            {frames.length > 0 && (
+              <div className="processing-live-frames-wrap">
+                <span className="live-frames-title">LIVE ONNX GENERATED FRAMES:</span>
+                <div className="live-frames-row">
+                  {frames.slice(-8).map((f) => (
+                    <div key={f.sequence_number} className="live-frame-mini-card">
+                      <img src={f.obfuscated_image} alt={`Frame ${f.sequence_number}`} />
+                      <span className="live-frame-seq">#{f.sequence_number}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Error Alert Box */}
+        {errorMsg && (
+          <div className="video-screen-error-box" role="alert">
+            <span className="error-icon">⚠️</span>
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
+        {/* =========================================================================
+            STATE 3: TWO TABS TO SEE THE TWO VIDEOS GENERATED (FIT MAJORITY OF SCREEN)
+            ========================================================================= */}
+        {hasResults && (
+          <div className="video-screen-player-container">
+            {/* Top Navigation Bar: The Two Tabs Switcher + File Meta */}
+            <div className="video-player-topbar">
+              <div className="video-player-file-info">
+                <span className="video-meta-filename">{selectedVideo?.name || 'video.mp4'}</span>
+                <span className="video-meta-badge">{metadata?.processed_frames_count || frames.length} FRAMES</span>
+                <span className="video-meta-badge engine-badge">{engineBackend}</span>
+              </div>
+
+              {/* THE TWO TABS */}
+              <div className="video-two-tabs-segmented" role="tablist" aria-label="Video View Switcher">
+                {/* TAB 1: CONCEALED VIDEO */}
                 <button
                   type="button"
-                  className="main-action-pushbutton"
-                  onClick={() => selectedVideo ? processVideoFile(selectedVideo) : triggerVideoInput()}
-                  disabled={isProcessing}
-                  aria-label={selectedVideo ? "Obfuscate video frames using ONNX" : "Select video to obfuscate"}
+                  role="tab"
+                  aria-selected={activeVideoTab === 'concealed'}
+                  className={`video-segmented-tab ${activeVideoTab === 'concealed' ? 'active' : ''}`}
+                  onClick={() => setActiveVideoTab('concealed')}
+                  title="View the generated concealed video with adversarial perturbations"
                 >
-                  <span className="pushbutton-content">
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                      <polygon points="23 7 16 12 23 17 23 7" />
-                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                    </svg>
-                    <span>{selectedVideo ? 'OBFUSCATE VIDEO FRAMES (ONNX ACCELERATED)' : 'SELECT VIDEO & OBFUSCATE'}</span>
-                  </span>
+                  <span className="tab-icon">🛡️</span>
+                  <span>CONCEALED VIDEO</span>
+                </button>
+
+                {/* TAB 2: ORIGINAL VIDEO */}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeVideoTab === 'original'}
+                  className={`video-segmented-tab ${activeVideoTab === 'original' ? 'active' : ''}`}
+                  onClick={() => setActiveVideoTab('original')}
+                  title="View the original unmodified input video"
+                >
+                  <span className="tab-icon">📹</span>
+                  <span>ORIGINAL VIDEO</span>
+                </button>
+
+                {/* SIDE-BY-SIDE TAB */}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeVideoTab === 'side-by-side'}
+                  className={`video-segmented-tab ${activeVideoTab === 'side-by-side' ? 'active' : ''}`}
+                  onClick={() => setActiveVideoTab('side-by-side')}
+                  title="Compare both videos side-by-side simultaneously"
+                >
+                  <span className="tab-icon">◫</span>
+                  <span>SIDE-BY-SIDE</span>
                 </button>
               </div>
 
-              <h2 className="protection-headline">Stay Concealed</h2>
-              <p className="protection-tagline">Real-Time Frame Obfuscation • ONNX Engine</p>
-            </>
-          )}
-
-          {/* Processing Screen with Live Progress */}
-          {isProcessing && (
-            <div className="video-processing-card" role="status" aria-live="polite">
-              <div className="processing-header-row">
-                <div className="processing-engine-badge">
-                  <span className="radar-dot" />
-                  <span>ONNX RUNTIME ACCELERATED</span>
-                </div>
-                <span className="processing-frame-counter">
-                  {processedCount} / {targetCount} FRAMES
-                </span>
-              </div>
-
-              <div className="processing-progress-track">
-                <div
-                  className="processing-progress-fill"
-                  style={{ width: `${progressPercent}%` }}
-                />
-              </div>
-
-              <div className="processing-status-text">
-                <div className="spinner-dots" />
-                <span>{statusMessage}</span>
-              </div>
-
-              {/* Live Preview of Last Processed Frame while processing */}
-              {frames.length > 0 && (
-                <div className="processing-live-frame-strip">
-                  <span className="live-frame-label">LIVE STREAMING OBFUSCATED FRAMES:</span>
-                  <div className="live-frame-row">
-                    {frames.slice(-6).map((f) => (
-                      <div key={f.sequence_number} className="live-frame-chip">
-                        <img src={f.obfuscated_image} alt={`Frame ${f.sequence_number}`} />
-                        <span className="live-frame-num">#{f.sequence_number}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+              {/* Reset Button */}
+              <button
+                type="button"
+                className="video-reset-button"
+                onClick={clearVideo}
+                title="Process another video"
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2">
+                  <path d="M23 4v6h-6" />
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                </svg>
+                <span>NEW VIDEO</span>
+              </button>
             </div>
-          )}
 
-          {/* Error Alert Box */}
-          {errorMsg && (
-            <div className="feature-error-box" style={{ maxWidth: '640px', marginBottom: '16px' }} role="alert">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              <span>{errorMsg}</span>
-            </div>
-          )}
-
-          {/* Completed Video & Frame Visualizer Workspace */}
-          {frames.length > 0 && !isProcessing && (
-            <div className="video-visualizer-container">
-
-              {/* Workspace Top Toolbar: View Switcher & File Details */}
-              <div className="visualizer-header-toolbar">
-                <div className="visualizer-file-meta">
-                  <span className="meta-filename">{selectedVideo?.name || 'video.mp4'}</span>
-                  <span className="meta-badge-count">{frames.length} FRAMES SHIELDED</span>
-                  <span className="meta-engine-tag">{engineBackend}</span>
-                </div>
-
-                <div className="visualizer-tab-toggle" role="tablist">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={workspaceTab === 'visualizer'}
-                    className={`viz-tab-btn ${workspaceTab === 'visualizer' ? 'active' : ''}`}
-                    onClick={() => setWorkspaceTab('visualizer')}
-                  >
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
-                      <rect x="3" y="3" width="18" height="18" rx="2" />
-                      <line x1="3" y1="9" x2="21" y2="9" />
-                      <line x1="9" y1="21" x2="9" y2="9" />
-                    </svg>
-                    <span>FRAME VISUALIZER</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={workspaceTab === 'video-player'}
-                    className={`viz-tab-btn ${workspaceTab === 'video-player' ? 'active' : ''}`}
-                    onClick={() => setWorkspaceTab('video-player')}
-                  >
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polygon points="5 3 19 12 5 21 5 3" />
-                    </svg>
-                    <span>RECONSTRUCTED VIDEO</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    className="viz-tab-btn new-video-btn"
-                    onClick={clearVideo}
-                    title="Process another video"
-                  >
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
-                      <line x1="12" y1="5" x2="12" y2="19" />
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                    </svg>
-                    <span>NEW VIDEO</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* TAB 1: FRAME VISUALIZER */}
-              {workspaceTab === 'visualizer' && activeFrame && (
-                <div className="frame-visualizer-main-panel">
-
-                  {/* Visualizer Viewport Mode Switcher */}
-                  <div className="visualizer-mode-bar">
-                    <span className="mode-bar-label">INSPECTOR MODE:</span>
-                    <div className="mode-btn-group">
-                      <button
-                        type="button"
-                        className={`sub-mode-btn ${viewportMode === 'slider' ? 'active' : ''}`}
-                        onClick={() => setViewportMode('slider')}
-                        title="Interactive Before / After Wipe Slider"
-                      >
-                        Split Slider
-                      </button>
-                      <button
-                        type="button"
-                        className={`sub-mode-btn ${viewportMode === 'side-by-side' ? 'active' : ''}`}
-                        onClick={() => setViewportMode('side-by-side')}
-                        title="Side-by-side comparison"
-                      >
-                        Side-by-Side
-                      </button>
-                      <button
-                        type="button"
-                        className={`sub-mode-btn ${viewportMode === 'concealed' ? 'active' : ''}`}
-                        onClick={() => setViewportMode('concealed')}
-                        title="Show full shielded frame"
-                      >
-                        Shielded Only
-                      </button>
-                      <button
-                        type="button"
-                        className={`sub-mode-btn ${viewportMode === 'original' ? 'active' : ''}`}
-                        onClick={() => setViewportMode('original')}
-                        title="Show original frame"
-                      >
-                        Original
-                      </button>
-                      {activeFrame.difference_image && (
-                        <button
-                          type="button"
-                          className={`sub-mode-btn ${viewportMode === 'difference' ? 'active' : ''}`}
-                          onClick={() => setViewportMode('difference')}
-                          title="Show adversarial perturbation noise heatmap"
-                        >
-                          Perturbation Map
-                        </button>
-                      )}
-                    </div>
+            {/* =====================================================================
+                CINEMA-SCALE VIDEO STAGE (FITS MAJORITY OF SCREEN)
+                ===================================================================== */}
+            <div className="video-cinema-viewport-stage">
+              {/* TAB 1: CONCEALED VIDEO ONLY */}
+              {activeVideoTab === 'concealed' && (
+                <div className="single-video-viewport">
+                  <div className="video-overlay-pill concealed">
+                    <span className="pill-dot purple" />
+                    <span>CONCEALED ADVERSARIAL VIDEO (ONNX ACCELERATED)</span>
                   </div>
-
-                  {/* Active Frame Display Viewport */}
-                  <div className="frame-viewport-stage">
-                    {viewportMode === 'slider' && (
-                      <div
-                        ref={sliderContainerRef}
-                        className="interactive-slider-wrapper"
-                        onMouseDown={handleMouseDown}
-                        onTouchStart={handleTouchStart}
-                        style={{ cursor: isDraggingSlider ? 'ew-resize' : 'default' }}
-                      >
-                        {/* Background: Original Image */}
-                        <img
-                          src={activeFrame.original_image}
-                          alt={`Frame ${activeFrame.sequence_number} Original`}
-                          className="slider-base-img"
-                          draggable={false}
-                        />
-                        <span className="slider-label slider-label-left">ORIGINAL</span>
-
-                        {/* Foreground: Obfuscated Image (Clipped) */}
-                        <div
-                          className="slider-overlay"
-                          style={{
-                            clipPath: `polygon(0 0, ${sliderPos}% 0, ${sliderPos}% 100%, 0 100%)`,
-                          }}
-                        >
-                          <img
-                            src={activeFrame.obfuscated_image}
-                            alt={`Frame ${activeFrame.sequence_number} Shielded`}
-                            className="slider-overlay-img"
-                            draggable={false}
-                          />
-                          <span className="slider-label slider-label-right">SHIELDED (ONNX)</span>
-                        </div>
-
-                        {/* Draggable Divider Line & Knob */}
-                        <div
-                          className="slider-divider"
-                          style={{ left: `${sliderPos}%` }}
-                        >
-                          <div className="slider-handle">
-                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5">
-                              <polyline points="15 18 9 12 15 6" />
-                              <polyline points="9 18 15 12 9 6" />
-                            </svg>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {viewportMode === 'side-by-side' && (
-                      <div className="side-by-side-wrapper">
-                        <div className="side-frame-card">
-                          <div className="side-frame-header">
-                            <span className="side-tag original">ORIGINAL FRAME #{activeFrame.sequence_number}</span>
-                          </div>
-                          <img
-                            src={activeFrame.original_image}
-                            alt="Original frame"
-                            className="side-frame-img"
-                          />
-                        </div>
-
-                        <div className="side-frame-card">
-                          <div className="side-frame-header">
-                            <span className="side-tag shielded">SHIELDED (ONNX)</span>
-                            <span className="side-metric">SSIM: {activeFrame.ssim}</span>
-                          </div>
-                          <img
-                            src={activeFrame.obfuscated_image}
-                            alt="Obfuscated frame"
-                            className="side-frame-img"
-                          />
-                        </div>
-                      </div>
-                    )}
-
-                    {viewportMode === 'concealed' && (
-                      <div className="single-frame-wrapper">
-                        <img
-                          src={activeFrame.obfuscated_image}
-                          alt="Concealed frame"
-                          className="single-frame-img"
-                        />
-                        <span className="viewport-overlay-badge shielded">SHIELDED • {activeFrame.psnr_db} dB PSNR</span>
-                      </div>
-                    )}
-
-                    {viewportMode === 'original' && (
-                      <div className="single-frame-wrapper">
-                        <img
-                          src={activeFrame.original_image}
-                          alt="Original frame"
-                          className="single-frame-img"
-                        />
-                        <span className="viewport-overlay-badge original">UNMODIFIED ORIGINAL</span>
-                      </div>
-                    )}
-
-                    {viewportMode === 'difference' && activeFrame.difference_image && (
-                      <div className="single-frame-wrapper">
-                        <img
-                          src={activeFrame.difference_image}
-                          alt="Adversarial noise delta heatmap"
-                          className="single-frame-img"
-                        />
-                        <span className="viewport-overlay-badge diff">ADVERSARIAL PERTURBATION MAP (6x AMPLIFIED)</span>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Active Frame Status & Telemetry HUD */}
-                  <div className="frame-telemetry-hud">
-                    <div className="hud-badge-group">
-                      <div className="hud-badge status-badge">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5">
-                          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                        </svg>
-                        <span>100% SHIELDED</span>
-                      </div>
-
-                      <div className="hud-badge">
-                        <span className="hud-k">FRAME</span>
-                        <span className="hud-v highlight">#{activeFrame.sequence_number} / {frames.length}</span>
-                      </div>
-
-                      <div className="hud-badge">
-                        <span className="hud-k">TIMESTAMP</span>
-                        <span className="hud-v">{activeFrame.timestamp_sec.toFixed(2)}s</span>
-                      </div>
-
-                      <div className="hud-badge">
-                        <span className="hud-k">INFERENCE</span>
-                        <span className="hud-v">{activeFrame.latency_ms.toFixed(1)} ms</span>
-                      </div>
-
-                      <div className="hud-badge">
-                        <span className="hud-k">PSNR</span>
-                        <span className="hud-v highlight">{activeFrame.psnr_db} dB</span>
-                      </div>
-
-                      <div className="hud-badge">
-                        <span className="hud-k">SSIM</span>
-                        <span className="hud-v">{activeFrame.ssim}</span>
-                      </div>
-
-                      <div className="hud-badge">
-                        <span className="hud-k">L_INF</span>
-                        <span className="hud-v">{activeFrame.linf_255} / 255</span>
-                      </div>
-                    </div>
-
-                    <div className="hud-actions-group">
-                      <button
-                        type="button"
-                        className="hud-action-btn"
-                        onClick={downloadActiveFrame}
-                        title="Download this shielded frame"
-                      >
-                        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                          <polyline points="7 10 12 15 17 10" />
-                          <line x1="12" y1="15" x2="12" y2="3" />
-                        </svg>
-                        <span>Frame</span>
-                      </button>
-
-                      {activeFrame.difference_image && (
-                        <button
-                          type="button"
-                          className="hud-action-btn"
-                          onClick={downloadDifferenceMap}
-                          title="Download adversarial noise mask"
-                        >
-                          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2">
-                            <rect x="3" y="3" width="18" height="18" rx="2" />
-                            <circle cx="12" cy="12" r="3" />
-                          </svg>
-                          <span>Perturbation</span>
-                        </button>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Playback Controls & Frame Scrubber */}
-                  <div className="frame-playback-controls">
-                    <button
-                      type="button"
-                      className="nav-step-btn"
-                      onClick={() => setActiveFrameIdx(0)}
-                      disabled={activeFrameIdx === 0}
-                      title="Jump to first frame"
-                    >
-                      |&lt;
-                    </button>
-
-                    <button
-                      type="button"
-                      className="nav-step-btn"
-                      onClick={() => setActiveFrameIdx((prev) => Math.max(0, prev - 1))}
-                      disabled={activeFrameIdx === 0}
-                      title="Previous frame (Left Arrow)"
-                    >
-                      &lt; Prev
-                    </button>
-
-                    <button
-                      type="button"
-                      className={`play-slideshow-btn ${isPlayingSlideshow ? 'playing' : ''}`}
-                      onClick={() => setIsPlayingSlideshow((prev) => !prev)}
-                      title={isPlayingSlideshow ? 'Pause animation (Space)' : 'Play animation (Space)'}
-                    >
-                      {isPlayingSlideshow ? (
-                        <>
-                          <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
-                            <rect x="6" y="4" width="4" height="16" />
-                            <rect x="14" y="4" width="4" height="16" />
-                          </svg>
-                          <span>PAUSE</span>
-                        </>
-                      ) : (
-                        <>
-                          <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
-                            <polygon points="5 3 19 12 5 21 5 3" />
-                          </svg>
-                          <span>PLAY SLIDESHOW</span>
-                        </>
-                      )}
-                    </button>
-
-                    <button
-                      type="button"
-                      className="nav-step-btn"
-                      onClick={() => setActiveFrameIdx((prev) => Math.min(frames.length - 1, prev + 1))}
-                      disabled={activeFrameIdx === frames.length - 1}
-                      title="Next frame (Right Arrow)"
-                    >
-                      Next &gt;
-                    </button>
-
-                    <button
-                      type="button"
-                      className="nav-step-btn"
-                      onClick={() => setActiveFrameIdx(frames.length - 1)}
-                      disabled={activeFrameIdx === frames.length - 1}
-                      title="Jump to last frame"
-                    >
-                      &gt;|
-                    </button>
-
-                    {/* Timeline Scrubber */}
-                    <div className="scrubber-range-container">
-                      <input
-                        type="range"
-                        min={0}
-                        max={frames.length - 1}
-                        value={activeFrameIdx}
-                        onChange={(e) => setActiveFrameIdx(parseInt(e.target.value, 10))}
-                        className="timeline-scrubber"
-                      />
-                    </div>
-
-                    {/* FPS Speed Selector */}
-                    <div className="slideshow-fps-picker">
-                      <span className="fps-label">FPS:</span>
-                      {[2, 4, 8, 16].map((fpsVal) => (
-                        <button
-                          key={fpsVal}
-                          type="button"
-                          className={`fps-chip ${slideshowFps === fpsVal ? 'active' : ''}`}
-                          onClick={() => setSlideshowFps(fpsVal)}
-                        >
-                          {fpsVal}x
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Horizontal Interactive Filmstrip Carousel */}
-                  <div className="filmstrip-container">
-                    <div className="filmstrip-title-row">
-                      <span className="filmstrip-title">FRAME SEQUENCE FILMSTRIP ({frames.length} EXTRACTED FRAMES)</span>
-                      <span className="filmstrip-hint">Click thumbnail to inspect</span>
-                    </div>
-
-                    <div ref={filmstripRef} className="filmstrip-scroll">
-                      {frames.map((f, idx) => (
-                        <div
-                          key={f.sequence_number}
-                          className={`filmstrip-card ${idx === activeFrameIdx ? 'active' : ''}`}
-                          onClick={() => setActiveFrameIdx(idx)}
-                          role="button"
-                          tabIndex={0}
-                          aria-label={`Frame ${f.sequence_number} at ${f.timestamp_sec}s`}
-                        >
-                          <div className="filmstrip-thumb-box">
-                            <img
-                              src={f.obfuscated_image}
-                              alt={`Frame ${f.sequence_number}`}
-                              className="filmstrip-thumb-img"
-                              loading="lazy"
-                            />
-                            <span className="filmstrip-badge">#{f.sequence_number}</span>
-                            <span className="filmstrip-shield-dot" title="Shielded with ONNX" />
-                          </div>
-                          <div className="filmstrip-card-footer">
-                            <span className="filmstrip-time">{f.timestamp_sec.toFixed(2)}s</span>
-                            <span className="filmstrip-psnr">{f.psnr_db}dB</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
+                  {concealedVideoUrl ? (
+                    <video
+                      key="concealed-player"
+                      src={concealedVideoUrl}
+                      controls
+                      autoPlay
+                      loop
+                      className="cinema-video-element"
+                    />
+                  ) : (
+                    <video
+                      key="preview-fallback"
+                      src={videoPreviewUrl || ''}
+                      controls
+                      autoPlay
+                      loop
+                      className="cinema-video-element"
+                    />
+                  )}
                 </div>
               )}
 
-              {/* TAB 2: RECONSTRUCTED VIDEO PLAYER */}
-              {workspaceTab === 'video-player' && (
-                <div className="reconstructed-video-panel">
-                  {/* Video Source Comparison Switcher */}
-                  <div className="video-source-switcher">
-                    <button
-                      type="button"
-                      className={`source-btn ${videoPlayerSource === 'concealed' ? 'active' : ''}`}
-                      onClick={() => setVideoPlayerSource('concealed')}
-                    >
-                      <span className="dot dot-green" />
-                      <span>Shielded Reconstructed Video</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={`source-btn ${videoPlayerSource === 'original' ? 'active' : ''}`}
-                      onClick={() => setVideoPlayerSource('original')}
-                    >
-                      <span className="dot dot-gray" />
-                      <span>Original Video</span>
-                    </button>
+              {/* TAB 2: ORIGINAL VIDEO ONLY */}
+              {activeVideoTab === 'original' && (
+                <div className="single-video-viewport">
+                  <div className="video-overlay-pill original">
+                    <span className="pill-dot blue" />
+                    <span>ORIGINAL UNMODIFIED SOURCE VIDEO</span>
+                  </div>
+                  <video
+                    key="original-player"
+                    src={videoPreviewUrl || ''}
+                    controls
+                    autoPlay
+                    loop
+                    className="cinema-video-element"
+                  />
+                </div>
+              )}
+
+              {/* TAB 3: SIDE-BY-SIDE DUAL VIEW */}
+              {activeVideoTab === 'side-by-side' && (
+                <div className="side-by-side-dual-viewport">
+                  <div className="dual-video-pane">
+                    <div className="video-overlay-pill original">
+                      <span className="pill-dot blue" />
+                      <span>ORIGINAL VIDEO</span>
+                    </div>
+                    <video
+                      ref={originalVideoRef}
+                      src={videoPreviewUrl || ''}
+                      controls
+                      autoPlay
+                      loop
+                      onPlay={handleOriginalPlay}
+                      onPause={handleOriginalPause}
+                      onSeeked={handleOriginalSeek}
+                      className="cinema-video-element dual"
+                    />
                   </div>
 
-                  {/* Main Video Viewport */}
-                  <div className="reconstructed-video-stage">
-                    {videoPlayerSource === 'concealed' && concealedVideoUrl ? (
+                  <div className="dual-video-pane">
+                    <div className="video-overlay-pill concealed">
+                      <span className="pill-dot purple" />
+                      <span>CONCEALED VIDEO (ONNX)</span>
+                    </div>
+                    {concealedVideoUrl ? (
                       <video
+                        ref={concealedVideoRef}
                         src={concealedVideoUrl}
                         controls
                         autoPlay
                         loop
-                        className="main-reconstructed-video"
+                        className="cinema-video-element dual"
                       />
                     ) : (
                       <video
+                        ref={concealedVideoRef}
                         src={videoPreviewUrl || ''}
                         controls
                         autoPlay
                         loop
-                        className="main-reconstructed-video"
+                        className="cinema-video-element dual"
                       />
                     )}
                   </div>
-
-                  {/* Summary Analytics Badges */}
-                  <div className="telemetry-badges-row" style={{ justifyContent: 'center', marginTop: '16px' }}>
-                    <div className="telemetry-badge">
-                      <span className="badge-k">FRAMES</span>
-                      <span className="badge-v highlight">{metadata?.processed_frames_count || frames.length}</span>
-                    </div>
-                    <div className="telemetry-badge">
-                      <span className="badge-k">ORIGINAL FPS</span>
-                      <span className="badge-v">{metadata?.fps || 24}</span>
-                    </div>
-                    {analytics && (
-                      <>
-                        <div className="telemetry-badge">
-                          <span className="badge-k">AVG LATENCY</span>
-                          <span className="badge-v">{analytics.avg_frame_latency_ms.toFixed(1)} ms</span>
-                        </div>
-                        <div className="telemetry-badge">
-                          <span className="badge-k">AVG PSNR</span>
-                          <span className="badge-v highlight">{analytics.avg_psnr_db.toFixed(1)} dB</span>
-                        </div>
-                        <div className="telemetry-badge">
-                          <span className="badge-k">AVG SSIM</span>
-                          <span className="badge-v">{analytics.avg_ssim.toFixed(4)}</span>
-                        </div>
-                      </>
-                    )}
-                    <div className="telemetry-badge">
-                      <span className="badge-k">ENGINE</span>
-                      <span className="badge-v highlight">{engineBackend}</span>
-                    </div>
-                  </div>
-
-                  {/* Video Actions */}
-                  <div className="video-actions-footer">
-                    {concealedVideoUrl && (
-                      <button
-                        type="button"
-                        className="feature-download-btn"
-                        onClick={downloadConcealedVideo}
-                      >
-                        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                          <polyline points="7 10 12 15 17 10" />
-                          <line x1="12" y1="15" x2="12" y2="3" />
-                        </svg>
-                        <span>Download Shielded Video (.mp4)</span>
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      className="mode-toggle-btn"
-                      style={{ padding: '8px 16px', border: '1px solid rgba(255, 255, 255, 0.2)' }}
-                      onClick={() => setWorkspaceTab('visualizer')}
-                    >
-                      Switch to Frame Visualizer
-                    </button>
-                  </div>
                 </div>
               )}
-
             </div>
-          )}
 
-        </div>
+            {/* Bottom Telemetry HUD & Download Action */}
+            <div className="video-cinema-footer-bar">
+              <div className="video-telemetry-chips">
+                <div className="telemetry-chip">
+                  <span className="chip-key">FRAMES</span>
+                  <span className="chip-val highlight">{metadata?.processed_frames_count || frames.length}</span>
+                </div>
+                <div className="telemetry-chip">
+                  <span className="chip-key">FPS</span>
+                  <span className="chip-val">{metadata?.fps || 24}</span>
+                </div>
+                {analytics && (
+                  <>
+                    <div className="telemetry-chip">
+                      <span className="chip-key">AVG LATENCY</span>
+                      <span className="chip-val">{analytics.avg_frame_latency_ms.toFixed(1)} ms</span>
+                    </div>
+                    <div className="telemetry-chip">
+                      <span className="chip-key">AVG PSNR</span>
+                      <span className="chip-val highlight">{analytics.avg_psnr_db.toFixed(1)} dB</span>
+                    </div>
+                    <div className="telemetry-chip">
+                      <span className="chip-key">AVG SSIM</span>
+                      <span className="chip-val">{analytics.avg_ssim.toFixed(4)}</span>
+                    </div>
+                  </>
+                )}
+                <div className="telemetry-chip">
+                  <span className="chip-key">ENGINE</span>
+                  <span className="chip-val highlight">{engineBackend}</span>
+                </div>
+              </div>
+
+              {/* Download Concealed Video Button */}
+              {concealedVideoUrl && (
+                <button
+                  type="button"
+                  className="video-download-action-btn"
+                  onClick={downloadConcealedVideo}
+                  title="Download the full shielded video as MP4"
+                >
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" />
+                    <line x1="12" y1="15" x2="12" y2="3" />
+                  </svg>
+                  <span>Download Concealed Video (.mp4)</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
       </div>
     </main>
   );

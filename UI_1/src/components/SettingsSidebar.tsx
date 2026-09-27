@@ -5,12 +5,16 @@ interface SettingsSidebarProps {
   isOpen?: boolean;
   onToggle?: () => void;
   currentView?: AppView;
+  selectedImageModel?: 'onnx' | 'pt';
+  onSelectImageModel?: (model: 'onnx' | 'pt') => void;
 }
 
 export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
   isOpen = true,
   onToggle,
   currentView = 'image',
+  selectedImageModel = 'onnx',
+  onSelectImageModel,
 }) => {
   const [resolution, setResolution] = useState(currentView === 'video' ? '1080P' : '1080P');
   const [format, setFormat] = useState(currentView === 'video' ? 'MP4' : 'PNG');
@@ -26,6 +30,8 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
     : ['PNG', 'JPEG', 'WEBP'];
 
   const modeOptions = ['HYBRID', 'RESIDUAL', 'NATIVE'];
+
+  const isVideo = currentView === 'video';
 
   return (
     <aside
@@ -64,8 +70,69 @@ export const SettingsSidebar: React.FC<SettingsSidebarProps> = ({
 
       <div className="branding-divider" role="separator" aria-hidden="true" />
 
-      {/* 4 Clean Settings Cards - Mirroring Left Column Formatting */}
+      {/* Settings Cards */}
       <div className="sidebar-statistics-cards">
+        {/* Card 0: Model Engine (ONNX vs PyTorch) */}
+        <div className="statistic-card setting-card">
+          <div className="setting-card-header">
+            <span className="statistic-card-label">MODEL ENGINE</span>
+            <span className={`setting-model-status-badge ${isVideo ? 'default-badge' : 'active-tag'}`}>
+              {isVideo ? 'DEFAULT (60 FPS)' : (selectedImageModel === 'onnx' ? 'ONNX RUNTIME' : 'PYTORCH')}
+            </span>
+          </div>
+
+          {isVideo ? (
+            <>
+              <div className="setting-pill-options">
+                <button
+                  type="button"
+                  className="setting-option-btn active"
+                  title="Locked to ONNX Runtime for real-time 60 FPS video frame processing"
+                >
+                  ONNX (.onnx)
+                </button>
+                <button
+                  type="button"
+                  className="setting-option-btn disabled"
+                  disabled
+                  title="PyTorch .pt is restricted on video to guarantee 60 FPS"
+                >
+                  PyTorch (.pt)
+                </button>
+              </div>
+              <p className="setting-engine-note">
+                ⚡ <strong>generator.onnx</strong> is the default engine for real-time video frame obfuscation.
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="setting-pill-options">
+                <button
+                  type="button"
+                  className={`setting-option-btn ${selectedImageModel === 'onnx' ? 'active' : ''}`}
+                  onClick={() => onSelectImageModel?.('onnx')}
+                  title="High-performance ONNX Runtime (generator.onnx)"
+                >
+                  ONNX (.onnx)
+                </button>
+                <button
+                  type="button"
+                  className={`setting-option-btn ${selectedImageModel === 'pt' ? 'active' : ''}`}
+                  onClick={() => onSelectImageModel?.('pt')}
+                  title="Native PyTorch generator weights (best_generator.pt)"
+                >
+                  PyTorch (.pt)
+                </button>
+              </div>
+              <p className="setting-engine-note">
+                {selectedImageModel === 'onnx'
+                  ? '🚀 ONNX Runtime: Fastest execution (<45ms) with optimized graph.'
+                  : '🧠 PyTorch: Native ResNet-UNet model (best_generator.pt).'}
+              </p>
+            </>
+          )}
+        </div>
+
         {/* Card 1: Resolution */}
         <div className="statistic-card setting-card">
           <div className="setting-card-header">

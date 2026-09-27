@@ -1,17 +1,34 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { WindowFrame } from './components/WindowFrame';
 import { Sidebar } from './components/Sidebar';
 import { SettingsSidebar } from './components/SettingsSidebar';
 import { MainWorkspace } from './components/MainWorkspace';
 import { VideoWorkspace } from './components/VideoWorkspace';
 import { FeatureObscuringWorkspace } from './components/FeatureObscuringWorkspace';
+import { ProbeWorkspace } from './components/ProbeWorkspace';
 import type { AppView } from './components/WindowHeader';
 import './App.css';
 
 export function App() {
   const [currentView, setCurrentView] = useState<AppView>('image');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(true);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [selectedImageModel, setSelectedImageModel] = useState<'onnx' | 'pt'>('onnx');
+
+  // When switching to video view, collapse settings and sidebar so video fits majority of screen
+  useEffect(() => {
+    if (currentView === 'video') {
+      setIsSettingsOpen(false);
+      setIsSidebarOpen(false);
+    } else {
+      setIsSidebarOpen(true);
+    }
+  }, [currentView]);
+
+  const handleVideoProcessingStart = () => {
+    setIsSettingsOpen(false);
+    setIsSidebarOpen(false);
+  };
 
   return (
     <WindowFrame
@@ -30,15 +47,18 @@ export function App() {
       />
 
       {/* Middle Column: Centered Workspace */}
-      {currentView === 'image' && <MainWorkspace />}
+      {currentView === 'image' && <MainWorkspace selectedModelEngine={selectedImageModel} />}
       {currentView === 'feature-obscuring' && <FeatureObscuringWorkspace />}
-      {currentView === 'video' && <VideoWorkspace />}
+      {currentView === 'video' && <VideoWorkspace onProcessingStart={handleVideoProcessingStart} />}
+      {currentView === 'probe' && <ProbeWorkspace selectedModelEngine={selectedImageModel} />}
 
       {/* Right Column: Settings (Mirrors Left Column) */}
       <SettingsSidebar
         isOpen={isSettingsOpen}
         onToggle={() => setIsSettingsOpen((prev) => !prev)}
         currentView={currentView}
+        selectedImageModel={selectedImageModel}
+        onSelectImageModel={setSelectedImageModel}
       />
     </WindowFrame>
   );

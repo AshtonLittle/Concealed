@@ -276,42 +276,64 @@ class ObfuscationService:
         device: Optional[str] = None,
     ) -> None:
         self.device_str = device or ("cuda" if _TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
-        self.torch_engine = None
-        self.backend_name = "Algorithmic-DCT-Engine"
-        self.model_path = None
+        self.onnx_engine = None
+        self.pt_engine = None
+        self.onnx_path = None
+        self.pt_path = None
+        self.active_image_model = "onnx"
 
-        # Auto-discover ONNX model or PyTorch checkpoint if not explicitly provided
-        if checkpoint_path is None:
-            candidates = [
-                os.environ.get("CONCEALED_ONNX_MODEL"),
-                "generator.onnx",
-                os.path.join(os.getcwd(), "generator.onnx"),
-                os.path.join(os.path.dirname(__file__), "..", "..", "generator.onnx"),
-                os.environ.get("CONCEALED_CHECKPOINT"),
-                "best_generator.pt",
-                os.path.join(os.getcwd(), "best_generator.pt"),
-                os.path.join(os.path.dirname(__file__), "..", "..", "best_generator.pt"),
-                "latest_generator.pt",
-                "runs/exp1/best_generator.pt",
-            ]
-            for cand in candidates:
-                if cand and os.path.exists(cand):
-                    checkpoint_path = str(os.path.abspath(cand))
+        # Check for generator.onnx
+        onnx_candidates = [
+            os.environ.get("CONCEALED_ONNX_MODEL"),
+            "generator.onnx",
+            os.path.join(os.getcwd(), "generator.onnx"),
+            os.path.join(os.path.dirname(__file__), "..", "..", "generator.onnx"),
+        ]
+        for c in onnx_candidates:
+            if c and os.path.exists(c):
+                try:
+                    from concealed.pipeline.realtime import RealtimeObfuscator
+                    self.onnx_engine = RealtimeObfuscator(c, device=self.device_str)
+                    self.onnx_path = str(os.path.abspath(c))
+                    print(f"[ObfuscationService] Loaded ONNX model from '{self.onnx_path}' on {self.device_str}")
                     break
+                except Exception as e:
+                    print(f"[ObfuscationService] Could not load ONNX model ({c}): {e}")
 
-        # Attempt to load RealtimeObfuscator (ONNX Runtime or PyTorch) if available
-        if checkpoint_path and os.path.exists(checkpoint_path):
-            try:
-                from concealed.pipeline.realtime import RealtimeObfuscator
-                self.torch_engine = RealtimeObfuscator(checkpoint_path, device=self.device_str)
-                self.model_path = checkpoint_path
-                if checkpoint_path.lower().endswith(".onnx"):
-                    self.backend_name = f"ONNXRuntime ({os.path.basename(checkpoint_path)})"
-                else:
-                    self.backend_name = f"PyTorch-NeuralGenerator ({os.path.basename(checkpoint_path)})"
-                print(f"[ObfuscationService] Loaded model from '{checkpoint_path}' on {self.device_str} ({self.backend_name})")
-            except Exception as e:
-                print(f"[ObfuscationService] Note: Could not load model checkpoint ({e}), running algorithmic engine.")
+        # Check for best_generator.pt
+        pt_candidates = [
+            checkpoint_path,
+            os.environ.get("CONCEALED_CHECKPOINT"),
+            "best_generator.pt",
+            os.path.join(os.getcwd(), "best_generator.pt"),
+            os.path.join(os.path.dirname(__file__), "..", "..", "best_generator.pt"),
+            "latest_generator.pt",
+            "runs/exp1/best_generator.pt",
+        ]
+        for c in pt_candidates:
+            if c and os.path.exists(c) and not str(c).lower().endswith(".onnx"):
+                try:
+                    from concealed.pipeline.realtime import RealtimeObfuscator
+                    self.pt_engine = RealtimeObfuscator(c, device=self.device_str)
+                    self.pt_path = str(os.path.abspath(c))
+                    print(f"[ObfuscationService] Loaded PyTorch model from '{self.pt_path}' on {self.device_str}")
+                    break
+                except Exception as e:
+                    print(f"[ObfuscationService] Could not load PyTorch model ({c}): {e}")
+
+        # Default torch_engine pointer for video / realtime backward compatibility
+        self.torch_engine = self.onnx_engine or self.pt_engine
+        self.model_path = self.onnx_path or self.pt_path
+        if self.onnx_engine is not None:
+            self.backend_name = f"ONNXRuntime ({os.path.basename(self.onnx_path)})"
+        elif self.pt_engine is not None:
+            self.backend_name = f"PyTorch-NeuralGenerator ({os.path.basename(self.pt_path)})"
+        else:
+            self.backend_name = "Algorithmic-DCT-Engine"
+
+        # Initialize Transformer / VLM Evasion Probe Service
+        from concealed.api.probe_service import ModelProbeService
+        self.probe_service = ModelProbeService(device=self.device_str)
 
     def get_status(self) -> Dict[str, Any]:
         """Return engine capabilities and device status."""
@@ -320,10 +342,111 @@ class ObfuscationService:
             "backend": self.backend_name,
             "device": self.device_str,
             "model_path": self.model_path,
+            "active_image_model": self.active_image_model,
+            "onnx_available": self.onnx_engine is not None,
+            "pt_available": self.pt_engine is not None,
             "torch_available": _TORCH_AVAILABLE,
             "scipy_available": _SCIPY_AVAILABLE,
-            "torch_engine_active": self.torch_engine is not None,
+            "torch_engine_active": (self.onnx_engine is not None or self.pt_engine is not None),
         }
+
+    def get_available_models(self) -> Dict[str, Any]:
+        """Return catalog of available obfuscation models for settings selection."""
+        models = []
+        if self.onnx_engine is not None or (self.onnx_path and os.path.exists(self.onnx_path)):
+            models.append({
+                "id": "onnx",
+                "name": "ONNX Runtime (generator.onnx)",
+                "type": "onnx",
+                "filename": "generator.onnx",
+                "path": self.onnx_path or "generator.onnx",
+                "available": self.onnx_engine is not None,
+                "description": "Ultra-fast graph execution (~15ms). Recommended default for 60fps video and real-time processing.",
+                "speed_tier": "Ultra-Fast",
+                "default_for_video": True,
+                "default_for_image": (self.active_image_model == "onnx"),
+            })
+        if self.pt_engine is not None or (self.pt_path and os.path.exists(self.pt_path)):
+            models.append({
+                "id": "pt",
+                "name": "PyTorch Generator (best_generator.pt)",
+                "type": "pt",
+                "filename": "best_generator.pt",
+                "path": self.pt_path or "best_generator.pt",
+                "available": self.pt_engine is not None,
+                "description": "Full PyTorch neural network checkpoint with high-precision floating point weights.",
+                "speed_tier": "Precision",
+                "default_for_video": False,
+                "default_for_image": (self.active_image_model == "pt"),
+            })
+        return {
+            "models": models,
+            "image_default": "onnx",
+            "video_default": "onnx",
+            "current_image_model": self.active_image_model,
+        }
+
+    def set_active_image_model(self, model_id: str) -> str:
+        """Update the default model used for image obfuscation."""
+        normalized = model_id.strip().lower()
+        if normalized in ("pt", "pytorch", "best_generator.pt"):
+            self.active_image_model = "pt"
+        else:
+            self.active_image_model = "onnx"
+        return self.active_image_model
+
+    def obfuscate_image_numpy(
+        self,
+        clean_rgb: np.ndarray,
+        model_engine: Optional[str] = None,
+        epsilon: float = 8.0,
+    ) -> np.ndarray:
+        """Run single image obfuscation directly on a uint8 RGB numpy array."""
+        target = (model_engine or self.active_image_model or "onnx").lower()
+        engine = self.pt_engine if target in ("pt", "pytorch") and self.pt_engine is not None else (self.onnx_engine or self.pt_engine)
+        if engine is not None:
+            try:
+                obf = engine.obfuscate_numpy(clean_rgb)
+                delta = obf.astype(np.float32) - clean_rgb.astype(np.float32)
+                delta = np.clip(delta, -epsilon, epsilon)
+                return np.clip(clean_rgb.astype(np.float32) + delta, 0, 255).astype(np.uint8)
+            except Exception as e:
+                print(f"[ObfuscationService] Engine error ({e}), falling back to DCT.")
+        params = ObfuscationParams(epsilon=epsilon, mode=SynthesisModeEnum.HYBRID)
+        delta = self._synthesize_delta(clean_rgb, params)
+        return np.clip(clean_rgb.astype(np.float32) + delta, 0, 255).astype(np.uint8)
+
+    def probe_image(
+        self,
+        clean_image_bytes: bytes,
+        obfuscated_image_bytes: Optional[bytes] = None,
+        prompt: str = "Describe the content of the image.",
+        model_ids: Optional[List[str]] = None,
+        model_engine: Optional[str] = None,
+    ) -> Any:
+        """Run full evaluation comparing Clean vs Concealed perception across Vision Transformers."""
+        return self.probe_service.probe_image(
+            clean_image_bytes=clean_image_bytes,
+            obfuscated_image_bytes=obfuscated_image_bytes,
+            prompt=prompt,
+            model_ids=model_ids,
+            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine),
+        )
+
+    def probe_options_siglip(
+        self,
+        clean_image_bytes: bytes,
+        obfuscated_image_bytes: Optional[bytes] = None,
+        options: Optional[List[str]] = None,
+        model_engine: Optional[str] = None,
+    ) -> Any:
+        """Run real Google SigLIP confidence evaluation on user-provided options."""
+        return self.probe_service.probe_options_siglip(
+            clean_image_bytes=clean_image_bytes,
+            obfuscated_image_bytes=obfuscated_image_bytes,
+            options=options,
+            obfuscator_func=lambda rgb: self.obfuscate_image_numpy(rgb, model_engine=model_engine),
+        )
 
     def _synthesize_delta(
         self,
@@ -417,44 +540,73 @@ class ObfuscationService:
 
         orig_w, orig_h = pil_input.size
 
-        # Obfuscation step: Neural Generator or Algorithmic Engine
-        if self.torch_engine is not None and getattr(self.torch_engine, "generator", None) is not None:
+        # Select target engine (ONNX vs PyTorch vs Algorithmic)
+        req_eng = (getattr(params, "model_engine", None) or self.active_image_model or "auto").lower()
+        if req_eng in ("pt", "pytorch", "best_generator.pt") and self.pt_engine is not None:
+            active_engine = self.pt_engine
+            engine_label = "PyTorch (best_generator.pt)"
+        elif req_eng in ("onnx", "generator.onnx") and self.onnx_engine is not None:
+            active_engine = self.onnx_engine
+            engine_label = "ONNXRuntime (generator.onnx)"
+        elif self.onnx_engine is not None:
+            active_engine = self.onnx_engine
+            engine_label = "ONNXRuntime (generator.onnx)"
+        elif self.pt_engine is not None:
+            active_engine = self.pt_engine
+            engine_label = "PyTorch (best_generator.pt)"
+        else:
+            active_engine = None
+            engine_label = "Algorithmic-DCT-Engine"
+
+        if active_engine is not None:
             try:
-                gen = self.torch_engine.generator
-                if hasattr(gen, "set_epsilon_255"):
-                    gen.set_epsilon_255(float(params.epsilon))
+                # If PyTorch generator is directly available on the engine
+                if getattr(active_engine, "generator", None) is not None and getattr(active_engine, "backend", "") != "onnx":
+                    gen = active_engine.generator
+                    if hasattr(gen, "set_epsilon_255"):
+                        gen.set_epsilon_255(float(params.epsilon))
 
-                tensor_in = torch.from_numpy(clean_rgb).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(self.torch_engine.device)
-
-                with torch.no_grad():
-                    obf_t, delta_t = gen(tensor_in, return_delta=True)
-
-                    # Chroma damping
+                    tensor_in = torch.from_numpy(clean_rgb).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(active_engine.device)
+                    with torch.no_grad():
+                        obf_t, delta_t = gen(tensor_in, return_delta=True)
+                        if params.chroma_damping > 0.0:
+                            delta_np = (delta_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0)
+                            delta_np = _apply_chroma_damping(delta_np, params.chroma_damping)
+                            delta_t = torch.from_numpy(delta_np).permute(2, 0, 1).unsqueeze(0).div(255.0).to(active_engine.device)
+                        if params.conforming_mask or params.target_features:
+                            conf_mask = _generate_conforming_mask(
+                                clean_rgb,
+                                target_features=params.target_features,
+                                feather_radius=params.feather_radius,
+                            )
+                            mask_t = torch.from_numpy(conf_mask).permute(2, 0, 1).unsqueeze(0).to(active_engine.device).float()
+                            delta_t = delta_t * mask_t
+                        obf_tensor = torch.clamp(tensor_in + delta_t, 0.0, 1.0)
+                        obf_rgb = (obf_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+                        obf_pil = Image.fromarray(obf_rgb)
+                else:
+                    # ONNX Runtime Execution
+                    obf_raw = active_engine.obfuscate_numpy(clean_rgb)
+                    delta = obf_raw.astype(np.float32) - clean_rgb.astype(np.float32)
                     if params.chroma_damping > 0.0:
-                        delta_np = (delta_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0)
-                        delta_np = _apply_chroma_damping(delta_np, params.chroma_damping)
-                        delta_t = torch.from_numpy(delta_np).permute(2, 0, 1).unsqueeze(0).div(255.0).to(self.torch_engine.device)
-
-                    # Conforming mask
+                        delta = _apply_chroma_damping(delta, params.chroma_damping)
                     if params.conforming_mask or params.target_features:
                         conf_mask = _generate_conforming_mask(
                             clean_rgb,
                             target_features=params.target_features,
                             feather_radius=params.feather_radius,
                         )
-                        mask_t = torch.from_numpy(conf_mask).permute(2, 0, 1).unsqueeze(0).to(self.torch_engine.device).float()
-                        delta_t = delta_t * mask_t
-
-                    obf_tensor = torch.clamp(tensor_in + delta_t, 0.0, 1.0)
-                    obf_rgb = (obf_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+                        delta = delta * conf_mask
+                    eps = float(params.epsilon)
+                    delta = np.clip(delta, -eps, eps)
+                    obf_rgb = np.clip(clean_rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
                     obf_pil = Image.fromarray(obf_rgb)
             except Exception as e:
-                print(f"[ObfuscationService] Generator forward error ({e}), falling back to algorithmic engine.")
+                print(f"[ObfuscationService] Generator ({engine_label}) forward error ({e}), falling back to algorithmic engine.")
                 delta = self._synthesize_delta(clean_rgb, params)
                 obf_rgb = np.clip(clean_rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
                 obf_pil = Image.fromarray(obf_rgb)
         else:
-            # Algorithmic DCT Engine
             delta = self._synthesize_delta(clean_rgb, params)
             obf_rgb = np.clip(clean_rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
             obf_pil = Image.fromarray(obf_rgb)

@@ -1,6 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-export const ProtectionStatus: React.FC = () => {
+interface ProtectionStatusProps {
+  selectedModelEngine?: 'onnx' | 'pt';
+}
+
+export const ProtectionStatus: React.FC<ProtectionStatusProps> = ({
+  selectedModelEngine = 'onnx',
+}) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -94,6 +100,7 @@ export const ProtectionStatus: React.FC = () => {
     formData.append('strip_metadata', 'true');
     formData.append('output_format', 'ORIGINAL');
     formData.append('response_type', 'image');
+    formData.append('model_engine', selectedModelEngine);
 
     try {
       const res = await fetch('http://127.0.0.1:8001/api/obfuscate', {
@@ -330,7 +337,9 @@ export const ProtectionStatus: React.FC = () => {
             <div className="telemetry-badges-row" style={{ justifyContent: 'center', marginBottom: '16px' }}>
               <div className="telemetry-badge">
                 <span className="badge-k">ENGINE</span>
-                <span className="badge-v highlight">latest_generator.pt</span>
+                <span className="badge-v highlight">
+                  {selectedModelEngine === 'onnx' ? 'generator.onnx' : 'best_generator.pt'}
+                </span>
               </div>
               <div className="telemetry-badge">
                 <span className="badge-k">PSNR</span>

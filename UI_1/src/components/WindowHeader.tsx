@@ -1,6 +1,6 @@
 import React from 'react';
 
-export type AppView = 'image' | 'video' | 'feature-obscuring' | 'benchmark';
+export type AppView = 'image' | 'video' | 'feature-obscuring' | 'probe' | 'benchmark';
 
 interface WindowHeaderProps {
   currentView?: AppView;
@@ -31,7 +31,7 @@ export const WindowHeader: React.FC<WindowHeaderProps> = ({
         </button>
       </div>
 
-      {/* Center: Workspace Navigation Tabs (Two Distinct Functional Groups) */}
+      {/* Center: Workspace Navigation Tabs (Three Distinct Functional Groups) */}
       <div className="topbar-center">
         <div className="topbar-nav-groups" role="navigation" aria-label="Workspace navigation">
           {/* Tab Group 1: Global AI Concealing (IMAGE & VIDEO) */}
@@ -78,6 +78,27 @@ export const WindowHeader: React.FC<WindowHeaderProps> = ({
                 onClick={() => onNavigate?.('feature-obscuring')}
               >
                 FEATURE OBSCURING
+              </button>
+            </div>
+          </div>
+
+          {/* Visual Divider between Groups */}
+          <div className="nav-groups-separator" aria-hidden="true" />
+
+          {/* Tab Group 3: Model Evasion Audit & Proof of Concept */}
+          <div className="nav-tab-group-container">
+            <span className="nav-tab-group-label">Evasion Proof</span>
+            <div className="nav-segmented-group nav-segmented-group-probe" role="tablist" aria-label="Model Probe mode">
+              {/* MODEL PROBE Tab */}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={currentView === 'probe'}
+                className={`nav-segmented-tab ${currentView === 'probe' ? 'active' : ''}`}
+                onClick={() => onNavigate?.('probe')}
+                title="Prompt Vision Transformers and VLMs to verify image understanding evasion"
+              >
+                MODEL PROBE
               </button>
             </div>
           </div>

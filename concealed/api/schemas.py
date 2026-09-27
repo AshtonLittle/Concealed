@@ -106,6 +106,12 @@ class ObfuscationParams(BaseModel):
     )
 
 
+    model_engine: Optional[str] = Field(
+        default="auto",
+        description="Model execution engine: 'onnx' (generator.onnx), 'pt' (best_generator.pt), or 'auto'.",
+    )
+
+
 class ObfuscationJSONRequest(ObfuscationParams):
     """JSON payload for base64 image obfuscation."""
 
@@ -168,3 +174,114 @@ class HealthResponse(BaseModel):
     version: str = "0.1.0"
     supported_formats: List[str] = ["PNG", "JPEG", "WEBP"]
     supported_modes: List[str] = ["hybrid", "canonical_residual", "native"]
+
+
+class ModelSpec(BaseModel):
+    """Specification of an available obfuscation model checkpoint."""
+
+    id: str
+    name: str
+    type: str  # 'onnx' | 'pt' | 'algorithmic'
+    filename: str
+    path: str
+    available: bool = True
+    description: str
+    speed_tier: str  # 'Ultra-Fast' | 'Balanced' | 'Precision'
+    default_for_video: bool = False
+    default_for_image: bool = False
+
+
+class ModelsCatalogResponse(BaseModel):
+    """Catalog of available generator models and view defaults."""
+
+    models: List[ModelSpec]
+    image_default: str
+    video_default: str
+    current_image_model: str
+
+
+class ModelProbeSpec(BaseModel):
+    """Specification of a Vision Transformer model available for probing/auditing."""
+
+    id: str
+    name: str
+    architecture: str
+    description: str
+    family: str  # 'CLIP' | 'SigLIP' | 'DINO' | 'VLM' | 'ViT'
+    target_layer: str
+    badge: str
+    default_selected: bool = True
+
+
+class FeatureConfidence(BaseModel):
+    """PaliGemma feature confidence analysis comparing Clean vs Concealed perception."""
+
+    feature: str
+    clean_confidence_pct: float
+    concealed_confidence_pct: float
+    confidence_drop_pct: float
+    status: str  # 'EVADED' | 'ATTENUATED' | 'DETECTED'
+    plain_english_insight: str
+
+
+class ModelProbeResult(BaseModel):
+    """Probe result comparing Clean vs Concealed outputs for a specific Vision Transformer."""
+
+    model_id: str
+    model_name: str
+    architecture: str
+    family: str
+    prompt: str
+    clean_output: str
+    concealed_output: str
+    evasion_status: str  # 'EVADED' | 'DISRUPTED' | 'DEGRADED'
+    evasion_score_pct: float  # [0.0 - 100.0]
+    cosine_similarity_clean: float
+    cosine_similarity_concealed: float
+    similarity_drop_pct: float
+    feature_dispersion_pct: float
+    latency_ms: float
+    plain_english_verdict: Optional[str] = None
+    feature_confidences: Optional[List[FeatureConfidence]] = None
+    details: Dict[str, Any] = {}
+
+
+class ProbeResponse(BaseModel):
+    """Response returned by the /api/probe endpoint."""
+
+    success: bool = True
+    prompt: str
+    total_models_probed: int
+    overall_evasion_pct: float
+    results: List[ModelProbeResult]
+    clean_image_url: Optional[str] = None
+    concealed_image_url: Optional[str] = None
+    processing_time_ms: float
+    conceal_engine_used: str
+    paligemma_plain_english_summary: Optional[str] = None
+    paligemma_feature_audit: Optional[List[FeatureConfidence]] = None
+
+
+class SiglipOptionScore(BaseModel):
+    """Real SigLIP confidence score for a specific option."""
+
+    option: str
+    clean_confidence_pct: float
+    concealed_confidence_pct: float
+    confidence_drop_pct: float
+    status: str  # 'Hidden' | 'Weakened' | 'Visible'
+
+
+class SiglipProbeResponse(BaseModel):
+    """Response from real SigLIP probe on a user-provided list of options."""
+
+    success: bool = True
+    clean_image_url: Optional[str] = None
+    concealed_image_url: Optional[str] = None
+    overall_protection_pct: float
+    options_hidden_count: int
+    total_options: int
+    avg_confidence_drop_pct: float
+    results: List[SiglipOptionScore]
+
+
