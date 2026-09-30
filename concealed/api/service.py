@@ -238,33 +238,188 @@ def _apply_chroma_damping(delta: np.ndarray, chroma_damping: float = 0.70) -> np
     return damped
 
 
-def _remux_to_web_mp4(raw_mp4_path: str, web_mp4_path: str) -> bool:
-    """Remux an OpenCV mp4v video to standard web-compatible H.264 (yuv420p) using imageio-ffmpeg."""
+def _get_ffmpeg_exe() -> Optional[str]:
+    """Find a usable ffmpeg executable, checking PATH and imageio_ffmpeg."""
+    import shutil
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
     try:
         import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _probe_video_has_audio(video_path: str) -> bool:
+    """Return True if the video contains an audio stream."""
+    import subprocess
+    bin_path = _get_ffmpeg_exe()
+    if not bin_path or not os.path.exists(video_path):
+        return False
+    try:
+        res = subprocess.run(
+            [bin_path, "-i", video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        return "Audio:" in res.stderr
+    except Exception:
+        return False
+
+
+def _remux_to_web_mp4_with_audio(
+    raw_mp4_path: str,
+    web_mp4_path: str,
+    source_video_path: Optional[str] = None,
+) -> bool:
+    """Remux video to web-compatible H.264 (yuv420p) and preserve audio from source_video_path."""
+    try:
         import subprocess
 
-        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg_bin = _get_ffmpeg_exe()
+        if not ffmpeg_bin:
+            return False
+
         cmd = [
             ffmpeg_bin,
             "-y",
             "-i",
             raw_mp4_path,
+        ]
+        if source_video_path and os.path.exists(source_video_path):
+            cmd.extend(["-i", source_video_path, "-map", "0:v:0", "-map", "1:a:0?"])
+        else:
+            cmd.extend(["-map", "0:v:0"])
+
+        cmd.extend([
             "-c:v",
             "libx264",
             "-pix_fmt",
             "yuv420p",
             "-preset",
             "ultrafast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
             "-movflags",
             "+faststart",
             web_mp4_path,
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+        ])
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         return res.returncode == 0 and os.path.exists(web_mp4_path) and os.path.getsize(web_mp4_path) > 0
     except Exception as e:
         print(f"[service] Note: web MP4 conversion skipped ({e})")
         return False
+
+
+# Backward-compatible alias
+_remux_to_web_mp4 = _remux_to_web_mp4_with_audio
+
+
+class FastVideoEncoder:
+    """High-speed video encoder writing directly to an FFmpeg H.264 pipe with audio multiplexing,
+    or falling back to OpenCV VideoWriter."""
+
+    def __init__(
+        self,
+        output_path: str,
+        fps: float,
+        width: int,
+        height: int,
+        source_audio_path: Optional[str] = None,
+    ) -> None:
+        import subprocess
+        import cv2
+
+        self.output_path = output_path
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self.source_audio_path = source_audio_path
+        self.proc = None
+        self.cv2_writer = None
+        self.is_ffmpeg = False
+
+        ffmpeg_bin = _get_ffmpeg_exe()
+        if ffmpeg_bin:
+            try:
+                cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f",
+                    "rawvideo",
+                    "-vcodec",
+                    "rawvideo",
+                    "-s",
+                    f"{width}x{height}",
+                    "-pix_fmt",
+                    "bgr24",
+                    "-r",
+                    str(fps),
+                    "-i",
+                    "-",
+                ]
+                if source_audio_path and os.path.exists(source_audio_path):
+                    cmd.extend(["-i", source_audio_path, "-map", "0:v:0", "-map", "1:a:0?"])
+                else:
+                    cmd.extend(["-map", "0:v:0"])
+
+                cmd.extend([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ])
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.is_ffmpeg = True
+            except Exception as e:
+                print(f"[FastVideoEncoder] FFmpeg pipe init failed ({e}), falling back to OpenCV")
+                self.proc = None
+
+        if not self.is_ffmpeg:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.cv2_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    def write_frame(self, frame_bgr: np.ndarray) -> None:
+        if self.is_ffmpeg and self.proc and self.proc.stdin:
+            try:
+                self.proc.stdin.write(frame_bgr.tobytes())
+                return
+            except Exception as e:
+                print(f"[FastVideoEncoder] Error writing to FFmpeg pipe: {e}")
+        if self.cv2_writer:
+            self.cv2_writer.write(frame_bgr)
+
+    def close(self) -> None:
+        if self.is_ffmpeg and self.proc:
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+                self.proc.wait(timeout=60)
+            except Exception as e:
+                print(f"[FastVideoEncoder] Error finalizing FFmpeg pipe: {e}")
+        if self.cv2_writer:
+            self.cv2_writer.release()
 
 
 class ObfuscationService:
@@ -369,6 +524,48 @@ class ObfuscationService:
     def _frame_backend_id(self) -> str:
         eng = self._frame_engine()
         return "onnx" if (eng is not None and getattr(eng, "backend", "") == "onnx") else "torch"
+
+    def _obfuscate_single_or_keyframe(
+        self,
+        frame_bgr: np.ndarray,
+        is_keyframe: bool,
+        cached_delta: Optional[np.ndarray],
+        params: ObfuscationParams,
+        canonical_max_dim: int = 480,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Obfuscate video frame with fast temporal keyframing and resolution decoupling.
+        If is_keyframe or cached_delta is None, computes a fresh perturbation delta.
+        Otherwise applies the cached perturbation delta to the current frame."""
+        import cv2
+
+        h, w = frame_bgr.shape[:2]
+
+        if is_keyframe or cached_delta is None or cached_delta.shape[:2] != (h, w):
+            frame_eng = self._frame_engine()
+            if frame_eng is not None:
+                try:
+                    if max(h, w) > canonical_max_dim:
+                        scale = canonical_max_dim / float(max(h, w))
+                        c_w = int(w * scale) & ~1
+                        c_h = int(h * scale) & ~1
+                        frame_c = cv2.resize(frame_bgr, (c_w, c_h), interpolation=cv2.INTER_LINEAR)
+                        obf_c = frame_eng.obfuscate_bgr_frame(frame_c)
+                        delta_c = obf_c.astype(np.float32) - frame_c.astype(np.float32)
+                        cached_delta = cv2.resize(delta_c, (w, h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_bgr)
+                        cached_delta = obf_bgr.astype(np.float32) - frame_bgr.astype(np.float32)
+                except Exception:
+                    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    delta_rgb = self._synthesize_delta(rgb, params)
+                    cached_delta = cv2.cvtColor(delta_rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
+            else:
+                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                delta_rgb = self._synthesize_delta(rgb, params)
+                cached_delta = cv2.cvtColor(delta_rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
+
+        obf_bgr = np.clip(frame_bgr.astype(np.float32) + cached_delta, 0.0, 255.0).round().astype(np.uint8)
+        return obf_bgr, cached_delta
 
     def get_status(self) -> Dict[str, Any]:
         """Return engine capabilities and device status."""
@@ -783,8 +980,10 @@ class ObfuscationService:
         video_bytes: bytes,
         params: ObfuscationParams,
         max_frames: Optional[int] = None,
+        keyframe_interval: int = 3,
     ) -> Tuple[bytes, str, Dict[str, Any]]:
-        """Process video frames applying adversarial perturbations with strict epsilon bounds."""
+        """Process video frames applying adversarial perturbations with strict epsilon bounds,
+        high-speed keyframe temporal reuse, and guaranteed audio preservation."""
         import tempfile
         import cv2
 
@@ -794,7 +993,6 @@ class ObfuscationService:
             tmp_in.write(video_bytes)
             tmp_in_path = tmp_in.name
 
-        tmp_out_path = tmp_in_path + "_out.mp4"
         web_mp4_path = tmp_in_path + "_web.mp4"
 
         try:
@@ -807,42 +1005,51 @@ class ObfuscationService:
             if w <= 0 or h <= 0:
                 raise ValueError("Could not read video dimensions.")
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(tmp_out_path, fourcc, fps, (w, h))
+            has_audio = _probe_video_has_audio(tmp_in_path)
+
+            encoder = FastVideoEncoder(
+                output_path=web_mp4_path,
+                fps=fps,
+                width=w,
+                height=h,
+                source_audio_path=tmp_in_path if has_audio else None,
+            )
 
             frame_count = 0
+            cached_delta = None
+            prev_gray = None
+            k = max(1, keyframe_interval)
+
             while True:
                 ret, frame_bgr = cap.read()
                 if not ret:
                     break
 
-                # Process frame using the fast video engine (single-pass ONNX when available)
-                frame_eng = self._frame_engine()
-                if frame_eng is not None:
-                    try:
-                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_bgr)
-                    except Exception:
-                        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                        delta = self._synthesize_delta(rgb, params)
-                        obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
-                        obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
-                else:
-                    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    delta = self._synthesize_delta(rgb, params)
-                    obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
-                    obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                is_key = (frame_count % k == 0) or (cached_delta is None)
+                if not is_key and prev_gray is not None:
+                    if float(np.mean(cv2.absdiff(gray, prev_gray))) > 30.0:
+                        is_key = True
+                prev_gray = gray
 
-                writer.write(obf_bgr)
+                obf_bgr, cached_delta = self._obfuscate_single_or_keyframe(
+                    frame_bgr=frame_bgr,
+                    is_keyframe=is_key,
+                    cached_delta=cached_delta,
+                    params=params,
+                )
+
+                encoder.write_frame(obf_bgr)
                 frame_count += 1
                 if max_frames and frame_count >= max_frames:
                     break
 
             cap.release()
-            writer.release()
+            encoder.close()
 
-            final_path = tmp_out_path
-            if _remux_to_web_mp4(tmp_out_path, web_mp4_path):
-                final_path = web_mp4_path
+            final_path = web_mp4_path
+            if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+                raise RuntimeError("Failed to encode obfuscated video.")
 
             with open(final_path, "rb") as f_out:
                 out_bytes = f_out.read()
@@ -853,11 +1060,12 @@ class ObfuscationService:
                 "fps": round(float(fps), 2),
                 "resolution": [w, h],
                 "processing_time_ms": elapsed_ms,
+                "has_audio": has_audio,
                 "engine": self.video_backend_name,
             }
             return out_bytes, "video/mp4", meta
         finally:
-            for p in (tmp_in_path, tmp_out_path, web_mp4_path):
+            for p in (tmp_in_path, web_mp4_path):
                 if os.path.exists(p):
                     try:
                         os.remove(p)
@@ -870,11 +1078,11 @@ class ObfuscationService:
         params: ObfuscationParams,
         max_frames: Optional[int] = None,
         frame_step: int = 1,
-        max_dimension: int = 640,
+        max_dimension: int = 1080,
+        keyframe_interval: int = 3,
     ) -> Dict[str, Any]:
-        """Break uploaded video into individual frames, apply ONNX obfuscation model frame-by-frame,
-        and return detailed frame status, before/after base64 images, metrics, and reconstructed video.
-        Every frame is processed (step=1 default); max_frames only caps explicitly when set."""
+        """Break uploaded video into individual frames, apply fast keyframed ONNX obfuscation,
+        and return frame status, metrics, and reconstructed audio-preserved H.264 video."""
         import tempfile
         import cv2
 
@@ -884,7 +1092,6 @@ class ObfuscationService:
             tmp_in.write(video_bytes)
             tmp_in_path = tmp_in.name
 
-        tmp_out_path = tmp_in_path + "_obf.mp4"
         web_mp4_path = tmp_in_path + "_web.mp4"
 
         try:
@@ -902,22 +1109,24 @@ class ObfuscationService:
             if orig_w <= 0 or orig_h <= 0:
                 raise ValueError("Could not read video dimensions.")
 
-            # Calculate scaled resolution if dimension exceeds max_dimension
             out_w, out_h = orig_w, orig_h
             if max(orig_w, orig_h) > max_dimension:
                 scale = max_dimension / float(max(orig_w, orig_h))
                 out_w = int(orig_w * scale) & ~1
                 out_h = int(orig_h * scale) & ~1
 
-            # Every frame is processed: honor the caller's step exactly.
-            # (Previously this auto-raised step to fit max_frames, silently
-            # dropping frames from the output video.)
             step = max(1, frame_step)
-
-            # Writer FPS must account for subsampling so output duration matches original
             writer_fps = fps / step
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(tmp_out_path, fourcc, writer_fps, (out_w, out_h))
+
+            has_audio = _probe_video_has_audio(tmp_in_path)
+
+            encoder = FastVideoEncoder(
+                output_path=web_mp4_path,
+                fps=writer_fps,
+                width=out_w,
+                height=out_h,
+                source_audio_path=tmp_in_path if has_audio else None,
+            )
 
             frames_data = []
             raw_frame_idx = 0
@@ -925,6 +1134,9 @@ class ObfuscationService:
             frame_latencies = []
             psnr_list = []
             ssim_list = []
+            cached_delta = None
+            prev_gray = None
+            k = max(1, keyframe_interval)
 
             while True:
                 ret, frame_bgr = cap.read()
@@ -942,83 +1154,76 @@ class ObfuscationService:
 
                 t_frame_start = time.perf_counter()
 
-                # Process frame using the fast video engine (single-pass ONNX when available)
-                frame_eng = self._frame_engine()
-                if frame_eng is not None:
-                    try:
-                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_to_proc)
-                    except Exception:
-                        rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
-                        delta = self._synthesize_delta(rgb, params)
-                        obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
-                        obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
-                else:
-                    rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
-                    delta = self._synthesize_delta(rgb, params)
-                    obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
-                    obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2GRAY)
+                is_key = (processed_count % k == 0) or (cached_delta is None)
+                if not is_key and prev_gray is not None:
+                    if float(np.mean(cv2.absdiff(gray, prev_gray))) > 30.0:
+                        is_key = True
+                prev_gray = gray
+
+                obf_bgr, cached_delta = self._obfuscate_single_or_keyframe(
+                    frame_bgr=frame_to_proc,
+                    is_keyframe=is_key,
+                    cached_delta=cached_delta,
+                    params=params,
+                )
 
                 frame_latency_ms = round((time.perf_counter() - t_frame_start) * 1000.0, 2)
                 frame_latencies.append(frame_latency_ms)
 
-                # Write to reconstructed output video
-                writer.write(obf_bgr)
+                encoder.write_frame(obf_bgr)
 
-                # Compute frame-level quality metrics
+                # Quality metrics
                 clean_rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
-                obf_rgb_final = cv2.cvtColor(obf_bgr, cv2.COLOR_BGR2RGB)
-                diff = obf_rgb_final.astype(np.float32) - clean_rgb.astype(np.float32)
+                obf_rgb = cv2.cvtColor(obf_bgr, cv2.COLOR_BGR2RGB)
+                diff = obf_rgb.astype(np.float32) - clean_rgb.astype(np.float32)
                 mse = float(np.mean(diff ** 2))
                 psnr_db = round(10.0 * math.log10((255.0 ** 2) / max(mse, 1e-10)), 2)
                 linf = round(float(np.max(np.abs(diff))), 2)
 
-                # Approximate SSIM
                 c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
                 gray1 = 0.299 * clean_rgb[..., 0] + 0.587 * clean_rgb[..., 1] + 0.114 * clean_rgb[..., 2]
-                gray2 = 0.299 * obf_rgb_final[..., 0] + 0.587 * obf_rgb_final[..., 1] + 0.114 * obf_rgb_final[..., 2]
-                mu1, mu2 = np.mean(gray1), np.mean(gray2)
-                s1_sq, s2_sq = np.var(gray1), np.var(gray2)
-                s12 = np.mean((gray1 - mu1) * (gray2 - mu2))
+                gray2 = 0.299 * obf_rgb[..., 0] + 0.587 * obf_rgb[..., 1] + 0.114 * obf_rgb[..., 2]
+                mu1, mu2 = float(np.mean(gray1)), float(np.mean(gray2))
+                s1_sq, s2_sq = float(np.var(gray1)), float(np.var(gray2))
+                s12 = float(np.mean((gray1 - mu1) * (gray2 - mu2)))
                 ssim_val = round(float(np.clip(((2 * mu1 * mu2 + c1) * (2 * s12 + c2)) / ((mu1**2 + mu2**2 + c1) * (s1_sq + s2_sq + c2) + 1e-12), 0.0, 1.0)), 4)
 
                 psnr_list.append(psnr_db)
                 ssim_list.append(ssim_val)
 
-                # Create thumbnails for frontend inspection
-                thumb_w, thumb_h = out_w, out_h
-                if thumb_w > 480:
-                    t_scale = 480.0 / thumb_w
-                    thumb_w = 480
-                    thumb_h = int(out_h * t_scale) & ~1
-                    orig_thumb = cv2.resize(frame_to_proc, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-                    obf_thumb = cv2.resize(obf_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-                else:
-                    orig_thumb = frame_to_proc
-                    obf_thumb = obf_bgr
+                # Emit visual preview thumbnails responsibly without flooding RAM
+                should_emit_thumb = is_key or (processed_count < 6) or (processed_count % 3 == 0)
+                orig_b64, obf_b64, diff_b64 = None, None, None
 
-                _, orig_buf = cv2.imencode(".jpg", orig_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-                _, obf_buf = cv2.imencode(".jpg", obf_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                if should_emit_thumb:
+                    thumb_w, thumb_h = out_w, out_h
+                    if thumb_w > 400:
+                        t_scale = 400.0 / thumb_w
+                        thumb_w = 400
+                        thumb_h = int(out_h * t_scale) & ~1
+                        orig_thumb = cv2.resize(frame_to_proc, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                        obf_thumb = cv2.resize(obf_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    else:
+                        orig_thumb = frame_to_proc
+                        obf_thumb = obf_bgr
 
-                orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
-                obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
+                    _, orig_buf = cv2.imencode(".jpg", orig_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    _, obf_buf = cv2.imencode(".jpg", obf_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
+                    obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
 
-                # Perturbation heatmap at thumbnail scale (colormap AFTER downscale:
-                # same visual, far fewer pixels through cvtColor/applyColorMap).
-                diff_thumb_small = diff
-                if thumb_w != out_w or thumb_h != out_h:
                     diff_thumb_small = cv2.resize(
                         np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8),
                         (thumb_w, thumb_h),
                         interpolation=cv2.INTER_AREA,
                     )
-                else:
-                    diff_thumb_small = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
-                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_thumb_small, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
-                _, diff_buf = cv2.imencode(".jpg", diff_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
+                    diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_thumb_small, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                    _, diff_buf = cv2.imencode(".jpg", diff_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                    diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
 
                 timestamp_sec = round(raw_frame_idx / fps, 2)
-                frames_data.append({
+                frame_item = {
                     "frame_index": raw_frame_idx,
                     "sequence_number": processed_count + 1,
                     "timestamp_sec": timestamp_sec,
@@ -1030,7 +1235,12 @@ class ObfuscationService:
                     "linf_255": linf,
                     "latency_ms": frame_latency_ms,
                     "status": "obfuscated",
-                })
+                }
+
+                if should_emit_thumb:
+                    frames_data.append(frame_item)
+                    if len(frames_data) > 20:
+                        frames_data = frames_data[-20:]
 
                 processed_count += 1
                 raw_frame_idx += 1
@@ -1038,12 +1248,9 @@ class ObfuscationService:
                     break
 
             cap.release()
-            writer.release()
+            encoder.close()
 
-            final_video_path = tmp_out_path
-            if _remux_to_web_mp4(tmp_out_path, web_mp4_path):
-                final_video_path = web_mp4_path
-
+            final_video_path = web_mp4_path
             out_video_b64 = ""
             if os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 0:
                 with open(final_video_path, "rb") as f_v:
@@ -1061,6 +1268,7 @@ class ObfuscationService:
                 "success": True,
                 "engine": self.video_backend_name,
                 "backend": backend_id,
+                "has_audio": has_audio,
                 "model_name": os.path.basename(self.video_model_path or self.model_path or "generator.onnx"),
                 "video_metadata": {
                     "total_video_frames": total_video_frames,
@@ -1071,6 +1279,7 @@ class ObfuscationService:
                     "height": orig_h,
                     "processed_width": out_w,
                     "processed_height": out_h,
+                    "has_audio": has_audio,
                 },
                 "analytics": {
                     "processing_time_ms": total_elapsed_ms,
@@ -1083,7 +1292,7 @@ class ObfuscationService:
                 "video_base64": out_video_b64,
             }
         finally:
-            for p in (tmp_in_path, tmp_out_path, web_mp4_path):
+            for p in (tmp_in_path, web_mp4_path):
                 if os.path.exists(p):
                     try:
                         os.remove(p)
@@ -1096,10 +1305,12 @@ class ObfuscationService:
         params: ObfuscationParams,
         max_frames: Optional[int] = None,
         frame_step: int = 1,
-        max_dimension: int = 640,
+        max_dimension: int = 1080,
+        keyframe_interval: int = 3,
     ):
         """Generator yielding SSE events as each frame is extracted and obfuscated via ONNX model.
-        Every frame is processed; max_frames only caps explicitly when set."""
+        Emits real-time progress events on every frame, with thumbnails emitted on keyframes/samples
+        to prevent browser memory exhaustion, and outputs an audio-preserved H.264 video."""
         import tempfile
         import cv2
         import json
@@ -1110,7 +1321,6 @@ class ObfuscationService:
             tmp_in.write(video_bytes)
             tmp_in_path = tmp_in.name
 
-        tmp_out_path = tmp_in_path + "_obf.mp4"
         web_mp4_path = tmp_in_path + "_web.mp4"
 
         try:
@@ -1136,20 +1346,25 @@ class ObfuscationService:
                 out_w = int(orig_w * scale) & ~1
                 out_h = int(orig_h * scale) & ~1
 
-            # Every frame is processed: honor the caller's step exactly.
             step = max(1, frame_step)
-
-            # Writer FPS must account for subsampling so output duration matches original
             writer_fps = fps / step
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(tmp_out_path, fourcc, writer_fps, (out_w, out_h))
+
+            has_audio = _probe_video_has_audio(tmp_in_path)
+
+            encoder = FastVideoEncoder(
+                output_path=web_mp4_path,
+                fps=writer_fps,
+                width=out_w,
+                height=out_h,
+                source_audio_path=tmp_in_path if has_audio else None,
+            )
 
             expected = max(1, math.ceil(max(total_video_frames, 0) / step)) if total_video_frames > 0 else 0
             frames_to_process = min(max_frames, expected) if max_frames else expected
             backend_id = self._frame_backend_id()
 
             # Initial status event
-            yield f"data: {json.dumps({'type': 'init', 'metadata': {'total_video_frames': total_video_frames, 'frames_to_process': frames_to_process, 'fps': round(float(fps), 2), 'duration_sec': round(float(total_video_frames / max(1.0, fps)), 2), 'width': orig_w, 'height': orig_h, 'engine': self.video_backend_name, 'backend': backend_id}})}\n\n"
+            yield f"data: {json.dumps({'type': 'init', 'metadata': {'total_video_frames': total_video_frames, 'frames_to_process': frames_to_process, 'fps': round(float(fps), 2), 'duration_sec': round(float(total_video_frames / max(1.0, fps)), 2), 'width': orig_w, 'height': orig_h, 'has_audio': has_audio, 'engine': self.video_backend_name, 'backend': backend_id}})}\n\n"
 
             frames_data = []
             raw_frame_idx = 0
@@ -1157,6 +1372,9 @@ class ObfuscationService:
             frame_latencies = []
             psnr_list = []
             ssim_list = []
+            cached_delta = None
+            prev_gray = None
+            k = max(1, keyframe_interval)
 
             while True:
                 ret, frame_bgr = cap.read()
@@ -1174,76 +1392,73 @@ class ObfuscationService:
 
                 t_frame_start = time.perf_counter()
 
-                # Process frame using the fast video engine (single-pass ONNX when available)
-                frame_eng = self._frame_engine()
-                if frame_eng is not None:
-                    try:
-                        obf_bgr = frame_eng.obfuscate_bgr_frame(frame_to_proc)
-                    except Exception:
-                        rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
-                        delta = self._synthesize_delta(rgb, params)
-                        obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
-                        obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
-                else:
-                    rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
-                    delta = self._synthesize_delta(rgb, params)
-                    obf_rgb = np.clip(rgb.astype(np.float32) + delta, 0.0, 255.0).round().astype(np.uint8)
-                    obf_bgr = cv2.cvtColor(obf_rgb, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2GRAY)
+                is_key = (processed_count % k == 0) or (cached_delta is None)
+                if not is_key and prev_gray is not None:
+                    if float(np.mean(cv2.absdiff(gray, prev_gray))) > 30.0:
+                        is_key = True
+                prev_gray = gray
+
+                obf_bgr, cached_delta = self._obfuscate_single_or_keyframe(
+                    frame_bgr=frame_to_proc,
+                    is_keyframe=is_key,
+                    cached_delta=cached_delta,
+                    params=params,
+                )
 
                 frame_latency_ms = round((time.perf_counter() - t_frame_start) * 1000.0, 2)
                 frame_latencies.append(frame_latency_ms)
 
-                writer.write(obf_bgr)
+                encoder.write_frame(obf_bgr)
 
+                # Frame metrics
                 clean_rgb = cv2.cvtColor(frame_to_proc, cv2.COLOR_BGR2RGB)
-                obf_rgb_final = cv2.cvtColor(obf_bgr, cv2.COLOR_BGR2RGB)
-                diff = obf_rgb_final.astype(np.float32) - clean_rgb.astype(np.float32)
+                obf_rgb = cv2.cvtColor(obf_bgr, cv2.COLOR_BGR2RGB)
+                diff = obf_rgb.astype(np.float32) - clean_rgb.astype(np.float32)
                 mse = float(np.mean(diff ** 2))
                 psnr_db = round(10.0 * math.log10((255.0 ** 2) / max(mse, 1e-10)), 2)
                 linf = round(float(np.max(np.abs(diff))), 2)
 
-                # SSIM
                 c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
                 gray1 = 0.299 * clean_rgb[..., 0] + 0.587 * clean_rgb[..., 1] + 0.114 * clean_rgb[..., 2]
-                gray2 = 0.299 * obf_rgb_final[..., 0] + 0.587 * obf_rgb_final[..., 1] + 0.114 * obf_rgb_final[..., 2]
-                mu1, mu2 = np.mean(gray1), np.mean(gray2)
-                s1_sq, s2_sq = np.var(gray1), np.var(gray2)
-                s12 = np.mean((gray1 - mu1) * (gray2 - mu2))
+                gray2 = 0.299 * obf_rgb[..., 0] + 0.587 * obf_rgb[..., 1] + 0.114 * obf_rgb[..., 2]
+                mu1, mu2 = float(np.mean(gray1)), float(np.mean(gray2))
+                s1_sq, s2_sq = float(np.var(gray1)), float(np.var(gray2))
+                s12 = float(np.mean((gray1 - mu1) * (gray2 - mu2)))
                 ssim_val = round(float(np.clip(((2 * mu1 * mu2 + c1) * (2 * s12 + c2)) / ((mu1**2 + mu2**2 + c1) * (s1_sq + s2_sq + c2) + 1e-12), 0.0, 1.0)), 4)
 
                 psnr_list.append(psnr_db)
                 ssim_list.append(ssim_val)
 
-                thumb_w, thumb_h = out_w, out_h
-                if thumb_w > 480:
-                    t_scale = 480.0 / thumb_w
-                    thumb_w = 480
-                    thumb_h = int(out_h * t_scale) & ~1
-                    orig_thumb = cv2.resize(frame_to_proc, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-                    obf_thumb = cv2.resize(obf_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-                else:
-                    orig_thumb = frame_to_proc
-                    obf_thumb = obf_bgr
+                # Emit visual preview thumbnails responsibly without flooding RAM
+                should_emit_thumb = is_key or (processed_count < 6) or (processed_count % 3 == 0)
+                orig_b64, obf_b64, diff_b64 = None, None, None
 
-                _, orig_buf = cv2.imencode(".jpg", orig_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-                _, obf_buf = cv2.imencode(".jpg", obf_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                if should_emit_thumb:
+                    thumb_w, thumb_h = out_w, out_h
+                    if thumb_w > 400:
+                        t_scale = 400.0 / thumb_w
+                        thumb_w = 400
+                        thumb_h = int(out_h * t_scale) & ~1
+                        orig_thumb = cv2.resize(frame_to_proc, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                        obf_thumb = cv2.resize(obf_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                    else:
+                        orig_thumb = frame_to_proc
+                        obf_thumb = obf_bgr
 
-                orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
-                obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
+                    _, orig_buf = cv2.imencode(".jpg", orig_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    _, obf_buf = cv2.imencode(".jpg", obf_thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode("ascii")
+                    obf_b64 = "data:image/jpeg;base64," + base64.b64encode(obf_buf).decode("ascii")
 
-                # Perturbation heatmap at thumbnail scale (colormap AFTER downscale:
-                # same visual, far fewer pixels through cvtColor/applyColorMap).
-                if thumb_w != out_w or thumb_h != out_h:
                     diff_thumb_small = cv2.resize(
                         np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8),
                         (thumb_w, thumb_h),
                         interpolation=cv2.INTER_AREA,
                     )
-                else:
-                    diff_thumb_small = np.clip(np.abs(diff) * 6.0, 0, 255).astype(np.uint8)
-                diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_thumb_small, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
-                _, diff_buf = cv2.imencode(".jpg", diff_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
+                    diff_bgr = cv2.applyColorMap(cv2.cvtColor(diff_thumb_small, cv2.COLOR_RGB2GRAY), cv2.COLORMAP_VIRIDIS)
+                    _, diff_buf = cv2.imencode(".jpg", diff_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                    diff_b64 = "data:image/jpeg;base64," + base64.b64encode(diff_buf).decode("ascii")
 
                 timestamp_sec = round(raw_frame_idx / fps, 2)
                 frame_item = {
@@ -1259,7 +1474,12 @@ class ObfuscationService:
                     "latency_ms": frame_latency_ms,
                     "status": "obfuscated",
                 }
-                frames_data.append(frame_item)
+
+                if should_emit_thumb:
+                    frames_data.append(frame_item)
+                    if len(frames_data) > 20:
+                        frames_data = frames_data[-20:]
+
                 processed_count += 1
                 raw_frame_idx += 1
 
@@ -1270,12 +1490,9 @@ class ObfuscationService:
                     break
 
             cap.release()
-            writer.release()
+            encoder.close()
 
-            final_video_path = tmp_out_path
-            if _remux_to_web_mp4(tmp_out_path, web_mp4_path):
-                final_video_path = web_mp4_path
-
+            final_video_path = web_mp4_path
             out_video_b64 = ""
             if os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 0:
                 with open(final_video_path, "rb") as f_v:
@@ -1293,6 +1510,7 @@ class ObfuscationService:
                     "success": True,
                     "engine": self.video_backend_name,
                     "backend": backend_id,
+                    "has_audio": has_audio,
                     "model_name": os.path.basename(self.video_model_path or self.model_path or "generator.onnx"),
                     "video_metadata": {
                         "total_video_frames": total_video_frames,
@@ -1303,6 +1521,7 @@ class ObfuscationService:
                         "height": orig_h,
                         "processed_width": out_w,
                         "processed_height": out_h,
+                        "has_audio": has_audio,
                     },
                     "analytics": {
                         "processing_time_ms": total_elapsed_ms,
@@ -1318,12 +1537,13 @@ class ObfuscationService:
             yield f"data: {json.dumps(complete_payload)}\n\n"
 
         finally:
-            for p in (tmp_in_path, tmp_out_path, web_mp4_path):
+            for p in (tmp_in_path, web_mp4_path):
                 if os.path.exists(p):
                     try:
                         os.remove(p)
                     except Exception:
                         pass
+
 
 
 

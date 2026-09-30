@@ -151,36 +151,146 @@ class RealtimeObfuscator:
         input_video: str | Path,
         output_video: str | Path,
         max_frames: Optional[int] = None,
+        keyframe_interval: int = 3,
     ) -> Dict[str, float]:
-        """Run the generator frame-by-frame over a video file and write the obfuscated video."""
-        out_path = Path(output_video)
+        """Run the generator over a video file, preserving audio and exporting to web-compatible H.264."""
+        import subprocess
+        import shutil
+
+        in_path = str(Path(input_video).resolve())
+        out_path = Path(output_video).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cap = cv2.VideoCapture(str(input_video))
+        cap = cv2.VideoCapture(in_path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open input video: {input_video}")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if fps <= 0 or math.isnan(fps):
+            fps = 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+
+        # Check for ffmpeg
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            try:
+                import imageio_ffmpeg
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_bin = None
+
+        # Check if source has audio
+        has_audio = False
+        if ffmpeg_bin:
+            try:
+                probe = subprocess.run(
+                    [ffmpeg_bin, "-i", in_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                )
+                has_audio = "Audio:" in probe.stderr
+            except Exception:
+                has_audio = False
+
+        pipe_proc = None
+        cv2_writer = None
+
+        if ffmpeg_bin:
+            try:
+                cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f", "rawvideo",
+                    "-vcodec", "rawvideo",
+                    "-s", f"{width}x{height}",
+                    "-pix_fmt", "bgr24",
+                    "-r", str(fps),
+                    "-i", "-",
+                ]
+                if has_audio:
+                    cmd.extend(["-i", in_path, "-map", "0:v:0", "-map", "1:a:0?"])
+                else:
+                    cmd.extend(["-map", "0:v:0"])
+
+                cmd.extend([
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-shortest",
+                    "-movflags", "+faststart",
+                    str(out_path),
+                ])
+                pipe_proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                pipe_proc = None
+
+        if pipe_proc is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            cv2_writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
 
         frame_count = 0
+        cached_delta = None
+        prev_gray = None
+        k = max(1, keyframe_interval)
         t0 = time.perf_counter()
+
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                obf_frame = self.obfuscate_bgr_frame(frame)
-                writer.write(obf_frame)
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                is_key = (frame_count % k == 0) or (cached_delta is None)
+                if not is_key and prev_gray is not None:
+                    if float(np.mean(cv2.absdiff(gray, prev_gray))) > 30.0:
+                        is_key = True
+                prev_gray = gray
+
+                if is_key or cached_delta is None:
+                    if max(height, width) > 480:
+                        scale = 480.0 / float(max(height, width))
+                        c_w = int(width * scale) & ~1
+                        c_h = int(height * scale) & ~1
+                        frame_c = cv2.resize(frame, (c_w, c_h), interpolation=cv2.INTER_LINEAR)
+                        obf_c = self.obfuscate_bgr_frame(frame_c)
+                        delta_c = obf_c.astype(np.float32) - frame_c.astype(np.float32)
+                        cached_delta = cv2.resize(delta_c, (width, height), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        obf_frame = self.obfuscate_bgr_frame(frame)
+                        cached_delta = obf_frame.astype(np.float32) - frame.astype(np.float32)
+
+                obf_frame = np.clip(frame.astype(np.float32) + cached_delta, 0.0, 255.0).round().astype(np.uint8)
+
+                if pipe_proc and pipe_proc.stdin:
+                    pipe_proc.stdin.write(obf_frame.tobytes())
+                elif cv2_writer:
+                    cv2_writer.write(obf_frame)
+
                 frame_count += 1
                 if max_frames is not None and frame_count >= max_frames:
                     break
         finally:
             cap.release()
-            writer.release()
+            if pipe_proc:
+                try:
+                    if pipe_proc.stdin:
+                        pipe_proc.stdin.close()
+                    pipe_proc.wait(timeout=60)
+                except Exception:
+                    pass
+            if cv2_writer:
+                cv2_writer.release()
 
         elapsed = max(1e-6, time.perf_counter() - t0)
         return {
@@ -188,6 +298,7 @@ class RealtimeObfuscator:
             "elapsed_sec": round(elapsed, 3),
             "avg_fps": round(frame_count / elapsed, 2),
             "avg_latency_ms": round((elapsed / max(1, frame_count)) * 1000.0, 2),
+            "has_audio": has_audio,
         }
 
     def benchmark(

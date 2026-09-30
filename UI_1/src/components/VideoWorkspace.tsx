@@ -49,6 +49,26 @@ export interface VideoWorkspaceProps {
   onStatsUpdate?: (stats: ConcealStats | null) => void;
 }
 
+function base64ToBlobUrl(dataUrl: string, mimeType = 'video/mp4'): string {
+  try {
+    if (!dataUrl || dataUrl.startsWith('blob:') || dataUrl.startsWith('http')) return dataUrl;
+    const parts = dataUrl.split(';base64,');
+    if (parts.length < 2) return dataUrl;
+    const mime = parts[0].replace('data:', '') || mimeType;
+    const binary = atob(parts[1]);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: mime });
+    return URL.createObjectURL(blob);
+  } catch (e) {
+    console.warn('Failed converting to blob url, using original data url', e);
+    return dataUrl;
+  }
+}
+
 export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
   budget = 8,
   mode: propMode = 'HYBRID',
@@ -221,6 +241,7 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
       formData.append('max_frames', maxFrames.toString());
     }
     formData.append('frame_step', '1');
+    formData.append('keyframe_interval', '3');
 
     try {
       // Step 1: Real-time SSE stream with ONNX acceleration
@@ -257,21 +278,25 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
                 setMetadata(meta);
                 setTargetCount(meta.frames_to_process || maxFrames);
                 if (meta.engine) setEngineBackend(meta.engine);
-                setStatusMessage(`Decomposing video • Active Engine: ${meta.engine || 'generator.onnx'}`);
+                const audioNote = meta.has_audio ? ' • Audio Preserved' : '';
+                setStatusMessage(`Processing video • Engine: ${meta.engine || 'generator.onnx'}${audioNote}`);
               } else if (event.type === 'frame') {
                 const newFrame: FrameItem = event.frame;
-                setFrames((prev) => [...prev, newFrame]);
+                if (newFrame.original_image || newFrame.obfuscated_image) {
+                  setFrames((prev) => [...prev.slice(-15), newFrame]);
+                }
                 setProcessedCount(event.processed || 0);
                 const pct = Math.round((event.progress || 0) * 100);
                 setProgressPercent(Math.min(96, Math.max(10, pct)));
-                setStatusMessage(`Applied ONNX obfuscator on Frame #${newFrame.sequence_number} (${newFrame.latency_ms} ms, PSNR ${newFrame.psnr_db} dB)`);
+                setStatusMessage(`Obfuscating Frame #${newFrame.sequence_number} (${newFrame.latency_ms} ms, PSNR ${newFrame.psnr_db} dB)`);
               } else if (event.type === 'complete') {
                 const res = event.result;
                 if (res.frames && res.frames.length > 0) {
                   setFrames(res.frames);
                 }
                 if (res.video_base64) {
-                  setConcealedVideoUrl(res.video_base64);
+                  const blobUrl = base64ToBlobUrl(res.video_base64);
+                  setConcealedVideoUrl(blobUrl);
                 }
                 if (res.video_metadata) {
                   setMetadata(res.video_metadata);
@@ -321,7 +346,8 @@ export const VideoWorkspace: React.FC<VideoWorkspaceProps> = ({
         const resData = await batchRes.json();
         setFrames(resData.frames || []);
         if (resData.video_base64) {
-          setConcealedVideoUrl(resData.video_base64);
+          const blobUrl = base64ToBlobUrl(resData.video_base64);
+          setConcealedVideoUrl(blobUrl);
         }
         if (resData.video_metadata) {
           setMetadata(resData.video_metadata);

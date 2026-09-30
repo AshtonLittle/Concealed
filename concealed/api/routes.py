@@ -524,6 +524,7 @@ async def obfuscate_video_frames(
     mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID, description="Synthesis mode"),
     max_frames: Optional[int] = Form(None, ge=1, le=100000, description="Optional cap on frames to process; omit to process every frame"),
     frame_step: int = Form(1, ge=1, le=30, description="Frame sampling step interval"),
+    keyframe_interval: int = Form(3, ge=1, le=60, description="Keyframe interval for temporal perturbation propagation"),
 ) -> Response:
     """Break video into individual frames, execute the fast ONNX obfuscation model on each frame,
     and return individual frame status, before/after visualizer imagery, and reconstructed video.
@@ -552,6 +553,7 @@ async def obfuscate_video_frames(
             params=params,
             max_frames=max_frames,
             frame_step=frame_step,
+            keyframe_interval=keyframe_interval,
         )
     except Exception as e:
         raise HTTPException(
@@ -569,6 +571,7 @@ async def obfuscate_video_stream_frames(
     mode: SynthesisModeEnum = Form(SynthesisModeEnum.HYBRID, description="Synthesis mode"),
     max_frames: Optional[int] = Form(None, ge=1, le=100000, description="Optional cap on frames to process; omit to process every frame"),
     frame_step: int = Form(1, ge=1, le=30, description="Frame sampling step interval"),
+    keyframe_interval: int = Form(3, ge=1, le=60, description="Keyframe interval for temporal perturbation propagation"),
 ) -> StreamingResponse:
     """Break video into individual frames, execute the fast ONNX obfuscation model on each frame,
     and stream individual frame status and before/after visualizer imagery in real-time via SSE.
@@ -597,6 +600,7 @@ async def obfuscate_video_stream_frames(
             params=params,
             max_frames=max_frames,
             frame_step=frame_step,
+            keyframe_interval=keyframe_interval,
         ),
         media_type="text/event-stream",
         headers={
